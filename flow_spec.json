@@ -1,0 +1,84 @@
+{
+  "name": "DeepSeek GEO Collector MVP",
+  "version": "0.1.0",
+  "mode": "yingdao_manual_build",
+  "workbook": {
+    "path": "/Users/pan/Documents/思阳/geo-evidence-collector/yingdao_mvp/questions.xlsx",
+    "sheet": "Tasks",
+    "columns": [
+      "id",
+      "question",
+      "platform",
+      "round",
+      "status",
+      "screenshot_path",
+      "answer_text_path",
+      "remark",
+      "updated_at"
+    ]
+  },
+  "outputs": {
+    "directory": "/Users/pan/Documents/思阳/geo-evidence-collector/yingdao_mvp/yingdao_results/{YYYYMMDD}",
+    "screenshot": "{id}_{platform}_round{round}_{HHMMSS}.png",
+    "answer_text": "{id}_{platform}_round{round}_{HHMMSS}.txt"
+  },
+  "supported_platforms": ["deepseek"],
+  "statuses": {
+    "pending": "待采集",
+    "running": "正在采集",
+    "success": "完成截图和结果保存",
+    "manual_required": "登录/验证/风控，需要人工处理",
+    "failed": "流程失败"
+  },
+  "manual_takeover_markers": [
+    "登录",
+    "验证码",
+    "验证",
+    "安全检测",
+    "人机验证",
+    "访问受限",
+    "captcha",
+    "verify"
+  ],
+  "main_flow": [
+    "Open workbook and read used range from Tasks.",
+    "For each row: continue only when status is pending, platform is deepseek, and question is not empty.",
+    "Before running, write status=running, remark=正在采集, updated_at=current time.",
+    "Call RunDeepSeek with current row values.",
+    "Write returned status, screenshot_path, answer_text_path, remark, updated_at back to the same row.",
+    "Wait 90 seconds before moving to the next row."
+  ],
+  "run_deepseek_flow": [
+    "Create output directory for current date.",
+    "Open real Chrome and navigate to https://chat.deepseek.com/.",
+    "Wait for page load.",
+    "Get page text and check manual_takeover_markers.",
+    "If markers are found, save screenshot and return manual_required.",
+    "Click New Chat.",
+    "Copy question to clipboard.",
+    "Click chat input.",
+    "Paste question.",
+    "Click Send.",
+    "Wait until Stop Generating disappears; fallback fixed wait is 90 seconds.",
+    "Check manual_takeover_markers again.",
+    "Try to collect the latest answer text and save it.",
+    "Save screenshot.",
+    "Return success."
+  ],
+  "failure_rules": [
+    "Never solve or bypass CAPTCHA.",
+    "On any exception, save screenshot when possible.",
+    "Write status=failed unless the page is login, verification, or security review; those cases use manual_required.",
+    "Put the failing stage name in remark."
+  ],
+  "failure_stage_names": [
+    "open_deepseek_failed",
+    "page_not_ready",
+    "new_chat_failed",
+    "input_not_found",
+    "send_failed",
+    "timeout_waiting_answer",
+    "screenshot_failed",
+    "write_excel_failed"
+  ]
+}
