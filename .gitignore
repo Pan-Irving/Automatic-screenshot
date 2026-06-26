@@ -5,6 +5,7 @@ __pycache__/
 .codex_spreadsheet_work/
 
 chrome_cdp_profile/
+chrome_cdp_profile_*/
 runtime/
 yingdao_results/
 

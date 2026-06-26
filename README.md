@@ -11,12 +11,14 @@
 
 ### 启动步骤
 
-1. 双击或运行 `start_chrome_cdp.command`。
-2. 确认打开的专用 Chrome 中 DeepSeek 已登录。
-3. 双击或运行 `start_web_console.command`。
-4. 浏览器打开 `http://127.0.0.1:8765`。
-5. 点击“导入默认 Excel”或上传 `.xlsx`。
-6. 点击“开始采集”。
+1. 双击或运行 `start_web_console.command`。
+2. 浏览器打开 `http://127.0.0.1:8765`。
+3. 在“账号准备”里选择本轮账号数量，默认 2 个账号。
+4. 点击“打开账号窗口”，后台会打开对应数量的专用 Chrome。
+5. 在打开的 Chrome 窗口中分别登录 DeepSeek。
+6. 回到后台，点击“检测状态”确认账号窗口可用。
+7. 点击“导入默认 Excel”或上传 `.xlsx`。
+8. 点击“开始采集”。
 
 ### 页面能力
 
@@ -45,7 +47,33 @@
 YINGDAO_COLLECTOR=cdp python3 server.py
 ```
 
-采集器连接 `start_chrome_cdp.command` 打开的专用 Chrome。每条任务都会打开新的 DeepSeek 页面，避免 GEO 前置探测的上下文污染。
+采集器连接 Web 后台打开的专用 Chrome 账号池。每条任务都会打开新的 DeepSeek 页面，避免 GEO 前置探测的上下文污染。
+
+账号池默认包含 3 个槽位，每个账号最多 2 条并发生成：
+
+```bash
+deepseek_a:9222:chrome_cdp_profile_deepseek_a:2
+deepseek_b:9223:chrome_cdp_profile_deepseek_b:2
+deepseek_c:9224:chrome_cdp_profile_deepseek_c:2
+```
+
+可通过 `YINGDAO_ACCOUNTS` 调整账号池，格式为 `account_id:cdp_port:profile_dir:max_concurrency`，多个账号用英文逗号分隔：
+
+```bash
+YINGDAO_ACCOUNTS="deepseek_a:9222:chrome_cdp_profile_deepseek_a:2,deepseek_b:9223:chrome_cdp_profile_deepseek_b:2" python3 server.py
+```
+
+`YINGDAO_MAX_WORKERS` 可作为全局上限；默认等于账号池总容量。例如 2 个账号、每个 2 并发时，默认总并发为 4。
+
+```bash
+YINGDAO_MAX_WORKERS=4 python3 server.py
+```
+
+`YINGDAO_DEFAULT_ACCOUNT_COUNT` 控制后台默认选择几个账号，默认是 2：
+
+```bash
+YINGDAO_DEFAULT_ACCOUNT_COUNT=2 python3 server.py
+```
 
 ## 文件约定
 
@@ -53,10 +81,10 @@ YINGDAO_COLLECTOR=cdp python3 server.py
 - 任务 Sheet：`Tasks`
 - 输出目录：`yingdao_results/YYYYMMDD/`
 - 输出子目录：`{question}/`
-- 截图文件名：`{id}_{platform}_round{round}_{HHMMSS}.png`
-- 回答文件名：`{id}_{platform}_round{round}_{HHMMSS}.txt`，内容包含本轮问题和 DeepSeek 回答。
-- 链接文件名：`{id}_{platform}_round{round}_{HHMMSS}_url.txt`
-- 搜索结果文件名：`{id}_{platform}_round{round}_{HHMMSS}_search_results.json`，内容为 DeepSeek 页面已展示的搜索结果证据。
+- 截图文件名：`{id}_{platform}_round{round}_{HHMMSS}_{task_uid后6位}.png`
+- 回答文件名：`{id}_{platform}_round{round}_{HHMMSS}_{task_uid后6位}.txt`，内容包含本轮问题和 DeepSeek 回答。
+- 链接文件名：`{id}_{platform}_round{round}_{HHMMSS}_{task_uid后6位}_url.txt`
+- 搜索结果文件名：`{id}_{platform}_round{round}_{HHMMSS}_{task_uid后6位}_search_results.json`，内容为 DeepSeek 页面已展示的搜索结果证据。
 
 ## 本机影刀应用
 
@@ -84,6 +112,9 @@ YINGDAO_COLLECTOR=cdp python3 server.py
 | `search_results_path` | 保存搜索结果 JSON 的绝对路径 |
 | `search_result_count` | JSON 中解析到的搜索结果条数 |
 | `search_read_count` | DeepSeek 页面显示的已阅读网页数 |
+| `account_id` | DeepSeek 账号槽位 |
+| `cdp_port` | 当前任务使用的 Chrome CDP 端口 |
+| `profile_dir` | 当前任务使用的 Chrome profile 目录 |
 | `remark` | 错误、验证或人工接管说明 |
 | `updated_at` | 当前处理时间 |
 
@@ -200,19 +231,22 @@ YINGDAO_COLLECTOR=cdp python3 server.py
 
 ## 低风控运行参数
 
-- 一次只处理一个问题。
-- 每题之间默认等待 3 到 8 秒。
-- 不使用多账号轮换。
-- 不并发打开多个 DeepSeek 窗口。
+- 默认使用多 Chrome profile、多 DeepSeek 账号池并发处理问题。
+- Web 后台先选择本轮账号数量，再打开对应账号窗口。
+- 每个账号默认最多 2 条并发生成，不把单账号压到 3 条。
+- 每个 worker 都会打开自己的 DeepSeek 新对话页面。
+- 任务启动之间有轻微错峰，避免同一瞬间打开多个页面。
+- 某个账号触发登录/验证/忙碌时，只暂停该账号继续接任务，其他账号继续收尾。
 - 不在验证后连续重试。
-- 固定 Chrome、固定账号、固定网络环境。
+- 不做自动绕验证或自动风控规避。
 
 ## 验收步骤
 
-1. 保持 DeepSeek 已登录，在 `questions.xlsx` 保留 3 条 `pending` 任务。
-2. 运行影刀流程，确认 3 行都写回 `success`。
-3. 检查 `screenshot_path` 对应文件存在，截图中能看到问题和回答。
-4. 检查 `answer_text_path` 对应文件存在；如果影刀取不到文本，允许为空，但 `remark` 要说明。
-5. 检查 `search_results_path` 对应 JSON 存在；有智能搜索结果时应包含 `read_count`、`results` 和 `citation_links`。
-6. 手动退出 DeepSeek 登录后再跑 1 行，确认写回 `manual_required` 且保存登录/验证页截图。
-7. 人工完成登录，将该行改回 `pending`，确认可继续完成采集。
+1. 只运行 `start_web_console.command`，不要提前启动 Chrome 脚本。
+2. 在后台选择 `2 个账号`，点击“打开账号窗口”，确认只打开两个专用 Chrome。
+3. 分别登录两个 DeepSeek 账号后点击“检测状态”，确认账号显示可用或至少不是未启动。
+4. 在 `questions.xlsx` 保留 6 条 `pending` 任务。
+5. 运行 Web 后台采集，确认任务只分配给本轮选择的账号。
+6. 检查任务详情里的 `account_id`、`cdp_port`、`cdp_target_id` 正确。
+7. 检查 `screenshot_path`、`answer_text_path`、`search_results_path` 对应文件存在。
+8. 选择 `3 个账号` 但只登录两个，确认第三个未登录账号不会在未选择时抢任务。

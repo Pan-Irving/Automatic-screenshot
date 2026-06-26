@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,74 @@ TASK_DELAY_SECONDS = int(os.getenv("YINGDAO_TASK_DELAY_SECONDS", "3"))
 TASK_DELAY_RANDOM_SECONDS = int(os.getenv("YINGDAO_TASK_DELAY_RANDOM_SECONDS", "5"))
 COLLECTOR_MODE = os.getenv("YINGDAO_COLLECTOR", "cdp").strip().lower()
 
+
+def _parse_account_slots() -> list[dict[str, Any]]:
+    raw = os.getenv("YINGDAO_ACCOUNTS", "").strip()
+    if not raw:
+        raw = ",".join(
+            [
+                "deepseek_a:9222:chrome_cdp_profile_deepseek_a:2",
+                "deepseek_b:9223:chrome_cdp_profile_deepseek_b:2",
+                "deepseek_c:9224:chrome_cdp_profile_deepseek_c:2",
+            ]
+        )
+    slots: list[dict[str, Any]] = []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            for index, item in enumerate(parsed):
+                if not isinstance(item, dict):
+                    continue
+                account_id = str(item.get("account_id") or item.get("id") or f"deepseek_{index + 1}").strip()
+                cdp_port = int(item.get("cdp_port") or item.get("port") or 9222 + index)
+                profile_dir = str(item.get("profile_dir") or f"chrome_cdp_profile_{account_id}").strip()
+                max_concurrency = max(1, min(2, int(item.get("max_concurrency") or 2)))
+                slots.append({
+                    "account_id": account_id,
+                    "cdp_port": cdp_port,
+                    "profile_dir": profile_dir,
+                    "max_concurrency": max_concurrency,
+                })
+    except Exception:
+        for index, part in enumerate(item.strip() for item in raw.split(",") if item.strip()):
+            pieces = [piece.strip() for piece in part.split(":")]
+            account_id = pieces[0] if pieces else f"deepseek_{index + 1}"
+            try:
+                cdp_port = int(pieces[1]) if len(pieces) > 1 and pieces[1] else 9222 + index
+            except Exception:
+                cdp_port = 9222 + index
+            profile_dir = pieces[2] if len(pieces) > 2 and pieces[2] else f"chrome_cdp_profile_{account_id}"
+            try:
+                max_concurrency = int(pieces[3]) if len(pieces) > 3 and pieces[3] else 2
+            except Exception:
+                max_concurrency = 2
+            slots.append({
+                "account_id": account_id,
+                "cdp_port": cdp_port,
+                "profile_dir": profile_dir,
+                "max_concurrency": max(1, min(2, max_concurrency)),
+            })
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for slot in slots:
+        account_id = str(slot.get("account_id") or "").strip()
+        if not account_id or account_id in seen:
+            continue
+        seen.add(account_id)
+        deduped.append(slot)
+    return deduped or [{
+        "account_id": "deepseek_a",
+        "cdp_port": 9222,
+        "profile_dir": "chrome_cdp_profile_deepseek_a",
+        "max_concurrency": 2,
+    }]
+
+
+ACCOUNT_SLOTS = _parse_account_slots()
+TOTAL_ACCOUNT_CAPACITY = max(1, sum(int(slot["max_concurrency"]) for slot in ACCOUNT_SLOTS))
+MAX_WORKERS = max(1, min(TOTAL_ACCOUNT_CAPACITY, int(os.getenv("YINGDAO_MAX_WORKERS", str(TOTAL_ACCOUNT_CAPACITY)))))
+DEFAULT_ENABLED_ACCOUNT_COUNT = max(1, min(len(ACCOUNT_SLOTS), int(os.getenv("YINGDAO_DEFAULT_ACCOUNT_COUNT", "2"))))
+
 STATUSES_EXECUTED = {"success", "failed", "manual_required"}
 
 app = FastAPI(title="yingdao_mvp Web Console")
@@ -37,10 +107,102 @@ app.mount("/results", StaticFiles(directory=str(RESULTS_DIR), check_dir=False), 
 _state_lock = threading.RLock()
 _runner_thread: threading.Thread | None = None
 _pause_requested = False
+_runner_enabled_account_ids: list[str] = []
 
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def default_enabled_account_ids() -> list[str]:
+    return [str(slot["account_id"]) for slot in ACCOUNT_SLOTS[:DEFAULT_ENABLED_ACCOUNT_COUNT]]
+
+
+def select_account_slots(enabled_account_ids: list[str] | None = None) -> list[dict[str, Any]]:
+    selected = [str(item) for item in (enabled_account_ids or []) if str(item)]
+    if not selected:
+        selected = default_enabled_account_ids()
+    selected_set = set(selected)
+    return [slot for slot in ACCOUNT_SLOTS if str(slot["account_id"]) in selected_set]
+
+
+def parse_enabled_account_ids(payload: dict[str, Any] | None) -> list[str]:
+    payload = payload or {}
+    raw_ids = payload.get("enabled_account_ids")
+    if isinstance(raw_ids, list):
+        ids = [str(item) for item in raw_ids if str(item)]
+    else:
+        ids = []
+    if not ids:
+        try:
+            count = int(payload.get("account_count") or DEFAULT_ENABLED_ACCOUNT_COUNT)
+        except Exception:
+            count = DEFAULT_ENABLED_ACCOUNT_COUNT
+        count = max(1, min(len(ACCOUNT_SLOTS), count))
+        ids = [str(slot["account_id"]) for slot in ACCOUNT_SLOTS[:count]]
+    known = {str(slot["account_id"]) for slot in ACCOUNT_SLOTS}
+    return [account_id for account_id in ids if account_id in known]
+
+
+def account_profile_path(slot: dict[str, Any]) -> Path:
+    raw = Path(str(slot.get("profile_dir") or f"chrome_cdp_profile_{slot['account_id']}")).expanduser()
+    return raw if raw.is_absolute() else BASE_DIR / raw
+
+
+def open_account_chrome(slot: dict[str, Any]) -> dict[str, Any]:
+    account_id = str(slot["account_id"])
+    cdp_port = int(slot["cdp_port"])
+    profile_path = account_profile_path(slot)
+    if cdp_collector.cdp_is_available(cdp_port):
+        ensured = cdp_collector.cdp_ensure_deepseek_page(cdp_port)
+        return {
+            "account_id": account_id,
+            "cdp_port": cdp_port,
+            "opened": False,
+            "deepseek_opened": ensured,
+            "message": "already_running_deepseek_ready" if ensured else "already_running_deepseek_open_failed",
+        }
+    profile_path.mkdir(parents=True, exist_ok=True)
+    log_path = Path("/tmp") / f"yingdao_chrome_cdp_{account_id}_{cdp_port}.log"
+    cmd = [
+        "open",
+        "-na",
+        "Google Chrome",
+        "--args",
+        f"--user-data-dir={profile_path}",
+        f"--remote-debugging-port={cdp_port}",
+        "--remote-debugging-address=127.0.0.1",
+        "--remote-allow-origins=*",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "https://chat.deepseek.com/",
+    ]
+    with log_path.open("ab") as log:
+        subprocess.run(cmd, stdout=log, stderr=log, check=False)
+    ensured = False
+    for _ in range(10):
+        if cdp_collector.cdp_is_available(cdp_port):
+            ensured = cdp_collector.cdp_ensure_deepseek_page(cdp_port)
+            break
+        time.sleep(0.5)
+    return {
+        "account_id": account_id,
+        "cdp_port": cdp_port,
+        "opened": True,
+        "deepseek_opened": ensured,
+        "message": "opened" if ensured else "opened_but_deepseek_page_not_ready",
+        "log_path": str(log_path),
+    }
+
+
+def account_status(slot: dict[str, Any]) -> dict[str, Any]:
+    status = cdp_collector.cdp_account_status(int(slot["cdp_port"]))
+    return {
+        **slot,
+        "profile_dir": str(slot["profile_dir"]),
+        "profile_path": str(account_profile_path(slot)),
+        **status,
+    }
 
 
 def load_tasks() -> list[dict[str, Any]]:
@@ -98,6 +260,11 @@ def normalize_task(raw: dict[str, Any], index: int) -> dict[str, Any]:
         "answer_text_length": raw.get("answer_text_length") or "",
         "screenshot_mode": str(raw.get("screenshot_mode") or ""),
         "collector": str(raw.get("collector") or ""),
+        "worker_id": str(raw.get("worker_id") or ""),
+        "account_id": str(raw.get("account_id") or ""),
+        "cdp_port": raw.get("cdp_port") or "",
+        "profile_dir": str(raw.get("profile_dir") or ""),
+        "cdp_target_id": str(raw.get("cdp_target_id") or ""),
         "remark": str(raw.get("remark") or ""),
         "error": "",
         "attempt_count": 0,
@@ -125,7 +292,20 @@ def task_summary() -> dict[str, Any]:
         runner_alive = _runner_thread is not None and _runner_thread.is_alive()
         if not runner_alive and _pause_requested:
             _pause_requested = False
-        current = next((task for task in tasks if task.get("status") == "running"), None)
+        running = [task for task in tasks if task.get("status") == "running"]
+        account_usage = {
+            str(slot["account_id"]): len([task for task in running if task.get("account_id") == slot["account_id"]])
+            for slot in ACCOUNT_SLOTS
+        }
+        accounts = [
+            {
+                **slot,
+                "active": account_usage.get(str(slot["account_id"]), 0),
+                "enabled": str(slot["account_id"]) in set(_runner_enabled_account_ids or default_enabled_account_ids()),
+            }
+            for slot in ACCOUNT_SLOTS
+        ]
+        current = running[0] if running else None
         pending = [task for task in tasks if task.get("status") == "pending"]
         executed = [task for task in tasks if task.get("status") in STATUSES_EXECUTED]
         return {
@@ -135,14 +315,21 @@ def task_summary() -> dict[str, Any]:
                 "task_delay_seconds": TASK_DELAY_SECONDS,
                 "task_delay_random_seconds": TASK_DELAY_RANDOM_SECONDS,
                 "collector_mode": COLLECTOR_MODE,
+                "max_workers": MAX_WORKERS,
+                "active_workers": len(running),
+                "accounts": accounts,
+                "total_account_capacity": TOTAL_ACCOUNT_CAPACITY,
+                "default_enabled_account_ids": default_enabled_account_ids(),
+                "enabled_account_ids": _runner_enabled_account_ids or default_enabled_account_ids(),
             },
             "current": current,
+            "running": running,
             "pending": pending,
             "executed": executed,
             "counts": {
                 "total": len(tasks),
                 "pending": len(pending),
-                "running": 1 if current else 0,
+                "running": len(running),
                 "executed": len(executed),
                 "success": len([task for task in tasks if task.get("status") == "success"]),
                 "failed": len([task for task in tasks if task.get("status") == "failed"]),
@@ -170,15 +357,46 @@ def collect_deepseek(task: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def run_pending_tasks() -> None:
-    global _pause_requested
-    append_event("runner_started", {})
+def run_pending_tasks(enabled_account_ids: list[str] | None = None) -> None:
+    global _pause_requested, _runner_enabled_account_ids
+    run_accounts = select_account_slots(enabled_account_ids)
+    run_capacity = max(1, sum(int(slot["max_concurrency"]) for slot in run_accounts))
+    run_max_workers = max(1, min(MAX_WORKERS, run_capacity))
+    _runner_enabled_account_ids = [str(slot["account_id"]) for slot in run_accounts]
+    append_event("runner_started", {"max_workers": run_max_workers, "accounts": run_accounts})
     try:
-        while True:
+        active: dict[Any, dict[str, Any]] = {}
+        disabled_accounts: set[str] = set()
+
+        def next_worker_id() -> str:
+            used = {meta["worker_id"] for meta in active.values()}
+            for index in range(1, run_max_workers + 1):
+                candidate = f"worker-{index}"
+                if candidate not in used:
+                    return candidate
+            return f"worker-{len(active) + 1}"
+
+        def active_count(account_id: str) -> int:
+            return len([meta for meta in active.values() if meta.get("account_id") == account_id])
+
+        def next_account_slot() -> dict[str, Any] | None:
+            for slot in run_accounts:
+                account_id = str(slot["account_id"])
+                if account_id in disabled_accounts:
+                    continue
+                if active_count(account_id) >= int(slot["max_concurrency"]):
+                    continue
+                if not cdp_collector.cdp_is_available(int(slot["cdp_port"])):
+                    disabled_accounts.add(account_id)
+                    append_event("account_disabled_cdp_unavailable", {"account_id": account_id, "cdp_port": slot["cdp_port"]})
+                    continue
+                return slot
+            return None
+
+        def claim_pending_task(worker_id: str, account: dict[str, Any]) -> dict[str, Any] | None:
             with _state_lock:
                 if _pause_requested:
-                    append_event("runner_paused", {})
-                    return
+                    return None
                 tasks = load_tasks()
                 task = next(
                     (
@@ -191,8 +409,7 @@ def run_pending_tasks() -> None:
                     None,
                 )
                 if not task:
-                    append_event("runner_idle", {})
-                    return
+                    return None
                 started_at = now_text()
                 task["status"] = "running"
                 task["started_at"] = started_at
@@ -200,35 +417,42 @@ def run_pending_tasks() -> None:
                 task["duration_seconds"] = ""
                 task["last_run_at"] = started_at
                 task["attempt_count"] = int(task.get("attempt_count") or 0) + 1
-                task["remark"] = "正在采集"
+                task["worker_id"] = worker_id
+                task["account_id"] = account["account_id"]
+                task["cdp_port"] = account["cdp_port"]
+                task["profile_dir"] = account["profile_dir"]
+                task["cdp_target_id"] = ""
+                task["remark"] = f"正在采集_{worker_id}_{account['account_id']}:{account['cdp_port']}"
                 task["error"] = ""
                 task["updated_at"] = started_at
                 save_tasks(tasks)
-                task_uid = task["task_uid"]
+                return dict(task)
 
-            append_event("task_started", {"task_uid": task_uid, "id": task.get("id")})
-            started_seconds = time.time()
-            try:
-                result = collect_deepseek(task)
-            except Exception as exc:
-                result = {
-                    "status": "failed",
-                    "screenshot_path": "",
-                    "answer_text_path": "",
-                    "answer_url": "",
-                    "url_text_path": "",
-                    "search_results_path": "",
-                    "search_result_count": "",
-                    "search_read_count": "",
-                    "html_path": "",
-                    "stage": "collector_exception",
-                    "answer_text_length": "",
-                    "screenshot_mode": "",
-                    "collector": COLLECTOR_MODE,
-                    "remark": f"run_deepseek_failed: {exc}",
-                    "error": str(exc),
-                }
+        def exception_result(exc: Exception, meta: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "status": "failed",
+                "screenshot_path": "",
+                "answer_text_path": "",
+                "answer_url": "",
+                "url_text_path": "",
+                "search_results_path": "",
+                "search_result_count": "",
+                "search_read_count": "",
+                "html_path": "",
+                "stage": "collector_exception",
+                "answer_text_length": "",
+                "screenshot_mode": "",
+                "collector": COLLECTOR_MODE,
+                "worker_id": meta.get("worker_id") or "",
+                "account_id": meta.get("account_id") or "",
+                "cdp_port": meta.get("cdp_port") or "",
+                "profile_dir": meta.get("profile_dir") or "",
+                "cdp_target_id": "",
+                "remark": f"run_deepseek_failed: {exc}",
+                "error": str(exc),
+            }
 
+        def finish_task(task_uid: str, result: dict[str, Any], started_seconds: float) -> dict[str, Any]:
             finished_at = now_text()
             duration = round(time.time() - started_seconds, 1)
             updates = {
@@ -247,27 +471,96 @@ def run_pending_tasks() -> None:
                 "answer_text_length": result.get("answer_text_length") or "",
                 "screenshot_mode": result.get("screenshot_mode") or "",
                 "collector": result.get("collector") or "",
+                "worker_id": result.get("worker_id") or "",
+                "account_id": result.get("account_id") or "",
+                "cdp_port": result.get("cdp_port") or "",
+                "profile_dir": result.get("profile_dir") or "",
+                "cdp_target_id": result.get("cdp_target_id") or "",
                 "remark": result.get("remark") or "",
                 "error": result.get("error") or "",
             }
             update_task(task_uid, updates)
-            append_event("task_finished", {"task_uid": task_uid, "status": updates["status"], "duration_seconds": duration})
-            if updates["status"] == "manual_required":
-                append_event("runner_stopped_manual_required", {"task_uid": task_uid})
-                return
+            append_event("task_finished", {
+                "task_uid": task_uid,
+                "status": updates["status"],
+                "duration_seconds": duration,
+                "worker_id": updates["worker_id"],
+                "account_id": updates["account_id"],
+                "cdp_port": updates["cdp_port"],
+            })
+            return updates
 
-            delay = TASK_DELAY_SECONDS
-            if TASK_DELAY_RANDOM_SECONDS > 0:
-                delay += int(time.time()) % (TASK_DELAY_RANDOM_SECONDS + 1)
-            for _ in range(max(0, delay)):
+        with ThreadPoolExecutor(max_workers=run_max_workers, thread_name_prefix="yingdao-worker") as executor:
+            while True:
                 with _state_lock:
-                    if _pause_requested:
-                        append_event("runner_paused_after_task", {"task_uid": task_uid})
-                        return
-                time.sleep(1)
+                    pause_requested = _pause_requested
+                while not pause_requested and len(active) < run_max_workers:
+                    account = next_account_slot()
+                    if not account:
+                        break
+                    worker_id = next_worker_id()
+                    task = claim_pending_task(worker_id, account)
+                    if not task:
+                        break
+                    task_uid = task["task_uid"]
+                    append_event("task_started", {
+                        "task_uid": task_uid,
+                        "id": task.get("id"),
+                        "worker_id": worker_id,
+                        "account_id": account["account_id"],
+                        "cdp_port": account["cdp_port"],
+                    })
+                    future = executor.submit(collect_deepseek, task)
+                    active[future] = {
+                        "task_uid": task_uid,
+                        "worker_id": worker_id,
+                        "account_id": account["account_id"],
+                        "cdp_port": account["cdp_port"],
+                        "profile_dir": account["profile_dir"],
+                        "started_seconds": time.time(),
+                    }
+                    time.sleep(0.6)
+                    with _state_lock:
+                        pause_requested = _pause_requested
+
+                if not active:
+                    with _state_lock:
+                        if _pause_requested:
+                            append_event("runner_paused", {})
+                            return
+                    append_event("runner_idle", {})
+                    return
+
+                done, _pending = wait(active.keys(), timeout=1, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    meta = active.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = exception_result(exc, meta)
+                    updates = finish_task(meta["task_uid"], result, meta["started_seconds"])
+                    if updates["status"] == "manual_required":
+                        disabled_accounts.add(str(updates.get("account_id") or meta["account_id"]))
+                        append_event("account_paused_manual_required", {
+                            "task_uid": meta["task_uid"],
+                            "worker_id": meta["worker_id"],
+                            "account_id": updates.get("account_id") or meta["account_id"],
+                            "cdp_port": updates.get("cdp_port") or meta["cdp_port"],
+                        })
+                    elif updates.get("stage") == "deepseek_busy" or "deepseek_busy" in str(updates.get("remark") or ""):
+                        disabled_accounts.add(str(updates.get("account_id") or meta["account_id"]))
+                        append_event("account_paused_deepseek_busy", {
+                            "task_uid": meta["task_uid"],
+                            "worker_id": meta["worker_id"],
+                            "account_id": updates.get("account_id") or meta["account_id"],
+                            "cdp_port": updates.get("cdp_port") or meta["cdp_port"],
+                        })
     finally:
         with _state_lock:
             _pause_requested = False
+            _runner_enabled_account_ids = []
         append_event("runner_finished", {})
 
 
@@ -323,9 +616,47 @@ def import_workbook(path: Path, source_label: str | None = None) -> dict[str, An
     return {"ok": True, "count": len(tasks), "path": source}
 
 
+async def read_json_body(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.body()
+        if not body:
+            return {}
+        data = json.loads(body.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+@app.get("/api/accounts/status")
+def api_accounts_status() -> dict[str, Any]:
+    accounts = [account_status(slot) for slot in ACCOUNT_SLOTS]
+    return {
+        "ok": True,
+        "accounts": accounts,
+        "default_enabled_account_ids": default_enabled_account_ids(),
+    }
+
+
+@app.post("/api/accounts/open")
+async def api_accounts_open(request: Request) -> dict[str, Any]:
+    payload = await read_json_body(request)
+    enabled_ids = parse_enabled_account_ids(payload)
+    slots = select_account_slots(enabled_ids)
+    if not slots:
+        return {"ok": False, "message": "请至少选择一个账号"}
+    results = [open_account_chrome(slot) for slot in slots]
+    append_event("accounts_open_requested", {"enabled_account_ids": enabled_ids, "results": results})
+    return {"ok": True, "enabled_account_ids": enabled_ids, "results": results}
+
+
 @app.post("/api/run")
-def api_run() -> dict[str, Any]:
-    global _runner_thread, _pause_requested
+async def api_run(request: Request) -> dict[str, Any]:
+    global _runner_thread, _pause_requested, _runner_enabled_account_ids
+    payload = await read_json_body(request)
+    enabled_ids = parse_enabled_account_ids(payload)
+    selected_accounts = select_account_slots(enabled_ids)
+    if not selected_accounts:
+        return {"ok": False, "message": "请至少选择一个账号"}
     with _state_lock:
         if _runner_thread is not None and _runner_thread.is_alive():
             return {"ok": False, "message": "已有采集任务正在运行"}
@@ -341,10 +672,19 @@ def api_run() -> dict[str, Any]:
         ]
         if not pending:
             return {"ok": False, "message": "没有可执行的 pending/deepseek 任务。请先导入任务，或把需要重跑的任务重新排队。"}
+        available_accounts = [
+            slot
+            for slot in selected_accounts
+            if cdp_collector.cdp_is_available(int(slot["cdp_port"]))
+        ]
+        if not available_accounts:
+            ports = ", ".join(str(slot["cdp_port"]) for slot in selected_accounts)
+            return {"ok": False, "message": f"选中的账号窗口还没有启动。请先点击“打开账号窗口”，或确认端口 {ports} 已启动。"}
         _pause_requested = False
-        _runner_thread = threading.Thread(target=run_pending_tasks, name="yingdao-runner", daemon=True)
+        _runner_enabled_account_ids = [str(slot["account_id"]) for slot in selected_accounts]
+        _runner_thread = threading.Thread(target=run_pending_tasks, args=(_runner_enabled_account_ids,), name="yingdao-runner", daemon=True)
         _runner_thread.start()
-    return {"ok": True, "message": "采集已启动"}
+    return {"ok": True, "message": "采集已启动", "enabled_account_ids": _runner_enabled_account_ids}
 
 
 @app.post("/api/pause")
@@ -382,6 +722,11 @@ def api_retry(task_uid: str) -> dict[str, Any]:
                 "search_results_path": "",
                 "search_result_count": "",
                 "search_read_count": "",
+                "worker_id": "",
+                "account_id": "",
+                "cdp_port": "",
+                "profile_dir": "",
+                "cdp_target_id": "",
                 "remark": "已重新排队",
                 "error": "",
             },
@@ -543,6 +888,53 @@ INDEX_HTML = """
     .runner-banner.pause-requested { background: var(--amber-soft); border-color: #f3c87b; color: #92400e; }
     .runner-banner.idle { background: #f8fafc; border-color: var(--line); color: var(--muted); }
     .runner-banner.paused { background: var(--green-soft); border-color: #bfe6c7; color: #166534; }
+    .account-panel {
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+      background: #fff;
+    }
+    .segmented {
+      display: inline-flex;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      overflow: hidden;
+      width: fit-content;
+      background: #fff;
+    }
+    .segmented button {
+      border: 0;
+      border-right: 1px solid var(--line);
+      border-radius: 0;
+      min-width: 86px;
+      justify-content: center;
+      box-shadow: none;
+    }
+    .segmented button:last-child { border-right: 0; }
+    .segmented button.active { background: var(--blue); color: #fff; }
+    .account-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .account-list {
+      display: grid;
+      gap: 8px;
+    }
+    .account-item {
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: var(--panel-soft);
+    }
+    .account-item.disabled { opacity: .55; }
+    .account-name { font-weight: 650; }
+    .account-sub { color: var(--muted); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
     h2 { font-size: 14px; margin: 0; letter-spacing: 0; }
     .toolbar {
       display: flex;
@@ -681,7 +1073,7 @@ INDEX_HTML = """
       <div class="brand-mark">GEO</div>
       <div>
         <h1>DeepSeek GEO 采集后台</h1>
-        <div class="subtitle">Excel 导入 · 串行采集 · 结果归档</div>
+        <div class="subtitle">Excel 导入 · 多账号并发采集 · 结果归档</div>
       </div>
     </div>
     <div class="toolbar">
@@ -695,6 +1087,23 @@ INDEX_HTML = """
   </header>
   <main>
     <div class="grid">
+      <section>
+        <div class="section-head">
+          <h2>账号准备</h2>
+          <button id="refreshAccountsBtn">检测状态</button>
+        </div>
+        <div class="account-panel">
+          <div>
+            <div class="label">本轮账号数量</div>
+            <div id="accountCountGroup" class="segmented"></div>
+          </div>
+          <div class="account-actions">
+            <button id="openAccountsBtn" class="primary">打开账号窗口</button>
+            <span id="accountHint" class="subtitle">默认启用 2 个账号。</span>
+          </div>
+          <div id="accountsList" class="account-list"></div>
+        </div>
+      </section>
       <section>
         <div class="section-head"><h2>任务概览</h2><span id="runnerState" class="status">未运行</span></div>
         <div id="runnerBanner" class="runner-banner idle">后台未运行。</div>
@@ -724,6 +1133,8 @@ INDEX_HTML = """
   <script>
     let selectedTaskUid = null;
     let selectedTask = null;
+    let accountStatuses = [];
+    let selectedAccountCount = Number(localStorage.getItem('yingdaoAccountCount') || '2') || 2;
 
     const statusText = {
       pending: '待执行',
@@ -756,6 +1167,64 @@ INDEX_HTML = """
       return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#39;'}[ch]));
     }
 
+    function selectedAccountIds() {
+      return accountStatuses.slice(0, selectedAccountCount).map(account => account.account_id);
+    }
+
+    function accountStatusBadge(account, enabled) {
+      if (!enabled) return '<span class="status">未启用</span>';
+      if (!account.cdp_available) return '<span class="status failed">未启动</span>';
+      if (!account.deepseek_open) return '<span class="status manual_required">未打开</span>';
+      if (account.gate_reason) return '<span class="status manual_required">需登录/验证</span>';
+      if (account.ready) return '<span class="status success">可用</span>';
+      return '<span class="status manual_required">待确认</span>';
+    }
+
+    function renderAccountControls() {
+      const maxCount = Math.max(1, accountStatuses.length || 3);
+      selectedAccountCount = Math.max(1, Math.min(selectedAccountCount, maxCount));
+      localStorage.setItem('yingdaoAccountCount', String(selectedAccountCount));
+      document.getElementById('accountCountGroup').innerHTML = Array.from({ length: maxCount }, (_, index) => {
+        const count = index + 1;
+        const active = count === selectedAccountCount ? ' active' : '';
+        return `<button class="${active}" data-account-count="${count}">${count} 个账号</button>`;
+      }).join('');
+      document.querySelectorAll('[data-account-count]').forEach(button => {
+        button.onclick = () => {
+          selectedAccountCount = Number(button.dataset.accountCount || '2');
+          localStorage.setItem('yingdaoAccountCount', String(selectedAccountCount));
+          renderAccountControls();
+        };
+      });
+      const enabledIds = new Set(selectedAccountIds());
+      document.getElementById('accountsList').innerHTML = accountStatuses.length ? accountStatuses.map(account => {
+        const enabled = enabledIds.has(account.account_id);
+        const disabledClass = enabled ? '' : ' disabled';
+        return `
+          <div class="account-item${disabledClass}">
+            <div>
+              <div class="account-name">${escapeHtml(account.account_id)} · ${escapeHtml(account.cdp_port)}</div>
+              <div class="account-sub">${escapeHtml(account.profile_dir)} · 并发 ${escapeHtml(account.max_concurrency)}</div>
+              ${account.current_url ? `<div class="account-sub">${escapeHtml(account.current_url)}</div>` : ''}
+            </div>
+            <div>${accountStatusBadge(account, enabled)}</div>
+          </div>
+        `;
+      }).join('') : '<div class="empty">还没有读取账号配置。</div>';
+      const selectedNames = selectedAccountIds().join('，');
+      document.getElementById('accountHint').textContent = selectedNames ? `本轮启用：${selectedNames}` : '请选择本轮账号数量。';
+    }
+
+    async function loadAccountStatus() {
+      const data = await api('/api/accounts/status');
+      accountStatuses = data.accounts || [];
+      if (!localStorage.getItem('yingdaoAccountCount')) {
+        selectedAccountCount = (data.default_enabled_account_ids || []).length || 2;
+      }
+      renderAccountControls();
+      return data;
+    }
+
     function renderTask(task) {
       const selected = task.task_uid === selectedTaskUid ? ' selected' : '';
       return `
@@ -763,7 +1232,8 @@ INDEX_HTML = """
           <div class="task-title">${escapeHtml(task.question)}</div>
           <div class="task-meta">
             ${statusBadge(task.status)}
-            <span>${escapeHtml(task.id || '')}</span>
+          <span>${escapeHtml(task.id || '')}</span>
+            ${task.account_id ? `<span>${escapeHtml(task.account_id)}:${escapeHtml(task.cdp_port || '')}</span>` : ''}
             <span>row ${escapeHtml(task.source_row || '')}</span>
             <span>round ${escapeHtml(task.round || '')}</span>
           </div>
@@ -804,6 +1274,7 @@ INDEX_HTML = """
         <div class="task-meta">
           ${statusBadge(task.status)}
           <span>${escapeHtml(task.id)}</span>
+          ${task.account_id ? `<span>${escapeHtml(task.account_id)}:${escapeHtml(task.cdp_port || '')}</span>` : ''}
           <span>开始：${escapeHtml(task.started_at)}</span>
           <span>执行次数：${escapeHtml(task.attempt_count)}</span>
         </div>
@@ -827,6 +1298,11 @@ INDEX_HTML = """
         ${detailRow('完成时间', task.finished_at)}
         ${detailRow('耗时', task.duration_seconds ? task.duration_seconds + ' 秒' : '')}
         ${detailRow('执行次数', task.attempt_count)}
+        ${detailRow('Worker', task.worker_id)}
+        ${detailRow('账号', task.account_id)}
+        ${detailRow('CDP 端口', task.cdp_port)}
+        ${detailRow('Profile', task.profile_dir)}
+        ${detailRow('CDP Target', task.cdp_target_id)}
         ${detailRow('采集器', task.collector)}
         ${detailRow('阶段', task.stage)}
         ${detailRow('文本长度', task.answer_text_length)}
@@ -865,7 +1341,7 @@ INDEX_HTML = """
       document.getElementById('executed').innerHTML = data.executed.length ? data.executed.map(renderTask).join('') : '<div class="empty">没有已执行任务。</div>';
       bindTaskClicks();
       if (selectedTaskUid) {
-        const all = [...data.pending, ...data.executed, ...(data.current ? [data.current] : [])];
+        const all = [...data.pending, ...data.executed, ...(data.running || [])];
         const fresh = all.find(task => task.task_uid === selectedTaskUid);
         if (fresh) renderDetail(fresh);
       }
@@ -877,14 +1353,15 @@ INDEX_HTML = """
       if (runner.running && runner.pause_requested) {
         badge.textContent = '暂停中';
         badge.className = 'status manual_required';
-        banner.textContent = '已请求暂停，当前任务完成后会停止继续执行。';
+        banner.textContent = `已请求暂停，运行中的 ${runner.active_workers || 0} 个任务完成后会停止继续执行。`;
         banner.className = 'runner-banner pause-requested';
         return;
       }
       if (runner.running) {
         badge.textContent = '运行中';
         badge.className = 'status running';
-        banner.textContent = '后台正在采集，任务会按顺序串行执行。';
+        const accountText = (runner.accounts || []).map(item => `${item.account_id} ${item.active || 0}/${item.max_concurrency}`).join('，');
+        banner.textContent = `后台正在多账号并发采集：${runner.active_workers || 0}/${runner.max_workers || 1} 个 worker 正在运行。${accountText ? '账号：' + accountText : ''}`;
         banner.className = 'runner-banner running';
         return;
       }
@@ -936,8 +1413,48 @@ INDEX_HTML = """
       banner.className = 'runner-banner paused';
     };
 
+    document.getElementById('refreshAccountsBtn').onclick = async () => {
+      const banner = document.getElementById('runnerBanner');
+      banner.textContent = '正在检测账号窗口状态。';
+      banner.className = 'runner-banner idle';
+      await loadAccountStatus();
+      banner.textContent = '账号状态已更新。';
+      banner.className = 'runner-banner paused';
+    };
+
+    document.getElementById('openAccountsBtn').onclick = async () => {
+      if (!accountStatuses.length) await loadAccountStatus();
+      const ids = selectedAccountIds();
+      if (!ids.length) return alert('请至少选择一个账号');
+      const banner = document.getElementById('runnerBanner');
+      banner.textContent = `正在打开账号窗口：${ids.join('，')}`;
+      banner.className = 'runner-banner running';
+      const result = await api('/api/accounts/open', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled_account_ids: ids })
+      });
+      if (!result.ok) {
+        alert(result.message || '打开账号窗口失败');
+        banner.textContent = result.message || '打开账号窗口失败';
+        banner.className = 'runner-banner pause-requested';
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      await loadAccountStatus();
+      banner.textContent = '账号窗口已打开。请在对应 Chrome 窗口完成 DeepSeek 登录后，再点击“开始采集”。';
+      banner.className = 'runner-banner paused';
+    };
+
     document.getElementById('runBtn').onclick = async () => {
-      const result = await api('/api/run', { method: 'POST' });
+      if (!accountStatuses.length) await loadAccountStatus();
+      const ids = selectedAccountIds();
+      if (!ids.length) return alert('请至少选择一个账号');
+      const result = await api('/api/run', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled_account_ids: ids })
+      });
       if (!result.ok) {
         alert(result.message || '启动失败');
         const banner = document.getElementById('runnerBanner');
@@ -961,6 +1478,7 @@ INDEX_HTML = """
       await refresh();
     };
 
+    loadAccountStatus().catch(() => {});
     refresh();
     setInterval(refresh, 3000);
   </script>

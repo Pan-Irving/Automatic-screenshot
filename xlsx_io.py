@@ -25,6 +25,11 @@ TASK_COLUMNS = [
     "answer_text_length",
     "screenshot_mode",
     "collector",
+    "worker_id",
+    "account_id",
+    "cdp_port",
+    "profile_dir",
+    "cdp_target_id",
     "remark",
     "updated_at",
 ]

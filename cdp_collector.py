@@ -34,10 +34,20 @@ GATE_MARKERS = (
     "verify",
 )
 
+BUSY_MARKERS = (
+    "有消息正在生成",
+    "请稍后再试",
+    "message is being generated",
+    "please try again later",
+)
+
 
 def run_deepseek(task: dict) -> dict:
     screenshot_path, answer_path, url_path, search_results_path = _make_paths(task)
-    if not _cdp_is_available():
+    cdp_port = _task_cdp_port(task)
+    account_id = str(task.get("account_id") or "")
+    profile_dir = str(task.get("profile_dir") or "")
+    if not _cdp_is_available(cdp_port):
         screenshot = _desktop_screenshot(screenshot_path)
         return {
             "status": "failed",
@@ -48,7 +58,10 @@ def run_deepseek(task: dict) -> dict:
             "search_results_path": "",
             "search_result_count": "",
             "search_read_count": "",
-            "remark": "cdp_not_available_请先运行 yingdao_mvp/start_chrome_cdp.command",
+            "account_id": account_id,
+            "cdp_port": cdp_port,
+            "profile_dir": profile_dir,
+            "remark": f"cdp_not_available_port_{cdp_port}_请先运行 start_chrome_cdp_multi.command",
         }
     return _run_deepseek_cdp(task, screenshot_path, answer_path, url_path, search_results_path)
 
@@ -61,11 +74,26 @@ def _run_deepseek_cdp(
     search_results_path: Path,
 ) -> dict:
     question_text = str(task.get("question") or "")
+    worker_id = str(task.get("worker_id") or "")
+    account_id = str(task.get("account_id") or "")
+    cdp_port = _task_cdp_port(task)
+    profile_dir = str(task.get("profile_dir") or "")
+    context: dict = {}
+    keep_tab_open = False
+
+    def attach_context(result: dict) -> dict:
+        result["worker_id"] = worker_id
+        result["cdp_target_id"] = str(context.get("target_id") or "")
+        result["account_id"] = account_id
+        result["cdp_port"] = cdp_port
+        result["profile_dir"] = profile_dir
+        return result
+
     try:
-        _cdp_open_deepseek(fresh=True)
+        context = _cdp_open_deepseek(fresh=True, cdp_port=cdp_port)
     except Exception as exc:
         screenshot = _desktop_screenshot(screenshot_path)
-        return {
+        return attach_context({
             "status": "failed",
             "screenshot_path": screenshot,
             "answer_text_path": "",
@@ -74,117 +102,168 @@ def _run_deepseek_cdp(
             "search_results_path": "",
             "search_result_count": "",
             "search_read_count": "",
-            "remark": _short_remark(f"cdp_open_failed: {exc}"),
-        }
+            "remark": _short_remark(f"cdp_open_failed_account={account_id}_port={cdp_port}: {exc}"),
+        })
 
-    time.sleep(1.5)
-    gate_reason = _cdp_gate_reason()
-    if gate_reason:
-        screenshot = _cdp_capture_page_screenshot(screenshot_path)
-        answer_url = _cdp_current_url()
-        url_text_path = _write_url(url_path, answer_url)
-        return {
-            "status": "manual_required",
-            "screenshot_path": screenshot,
-            "answer_text_path": "",
-            "answer_url": answer_url,
-            "url_text_path": url_text_path,
-            "search_results_path": "",
-            "search_result_count": "",
-            "search_read_count": "",
-            "remark": f"DeepSeek 触发登录/验证/风控: {gate_reason}",
-        }
-
-    _cdp_install_completion_capture()
-    if not _cdp_submit_question(question_text):
-        screenshot = _cdp_capture_page_screenshot(screenshot_path)
-        answer_url = _cdp_current_url()
-        url_text_path = _write_url(url_path, answer_url)
-        return {
-            "status": "failed",
-            "screenshot_path": screenshot,
-            "answer_text_path": "",
-            "answer_url": answer_url,
-            "url_text_path": url_text_path,
-            "search_results_path": "",
-            "search_result_count": "",
-            "search_read_count": "",
-            "remark": "cdp_input_not_found_or_send_failed",
-        }
-
-    time.sleep(2)
-    gate_reason = _cdp_gate_reason()
-    if gate_reason:
-        screenshot = _cdp_capture_page_screenshot(screenshot_path)
-        answer_url = _cdp_current_url()
-        url_text_path = _write_url(url_path, answer_url)
-        return {
-            "status": "manual_required",
-            "screenshot_path": screenshot,
-            "answer_text_path": "",
-            "answer_url": answer_url,
-            "url_text_path": url_text_path,
-            "search_results_path": "",
-            "search_result_count": "",
-            "search_read_count": "",
-            "remark": f"DeepSeek 触发登录/验证/风控: {gate_reason}",
-        }
-
-    answer_text = _cdp_wait_answer()
-    _cdp_wait_completion_capture()
-    answer_url = _cdp_current_url()
-    search_fields, search_remark = _capture_search_results(
-        search_results_path, question_text, answer_url
-    )
+    ws_url = str(context.get("ws_url") or "")
     try:
-        screenshot, extracted_text, screenshot_mode = _cdp_capture_deepseek_evidence(
-            screenshot_path, question_text
+        time.sleep(1.5)
+        gate_reason = _cdp_gate_reason(ws_url)
+        if gate_reason:
+            keep_tab_open = True
+            screenshot = _cdp_capture_page_screenshot(screenshot_path, ws_url)
+            answer_url = _cdp_current_url(ws_url)
+            url_text_path = _write_url(url_path, answer_url)
+            return attach_context({
+                "status": "manual_required",
+                "screenshot_path": screenshot,
+                "answer_text_path": "",
+                "answer_url": answer_url,
+                "url_text_path": url_text_path,
+                "search_results_path": "",
+                "search_result_count": "",
+                "search_read_count": "",
+                "remark": f"DeepSeek 触发登录/验证/风控_account={account_id}_port={cdp_port}: {gate_reason}",
+            })
+
+        _cdp_install_completion_capture(ws_url)
+        if not _cdp_submit_question(question_text, ws_url):
+            screenshot = _cdp_capture_page_screenshot(screenshot_path, ws_url)
+            answer_url = _cdp_current_url(ws_url)
+            url_text_path = _write_url(url_path, answer_url)
+            return attach_context({
+                "status": "failed",
+                "screenshot_path": screenshot,
+                "answer_text_path": "",
+                "answer_url": answer_url,
+                "url_text_path": url_text_path,
+                "search_results_path": "",
+                "search_result_count": "",
+                "search_read_count": "",
+                "remark": "cdp_input_not_found_or_send_failed",
+            })
+
+        time.sleep(2)
+        busy_reason = _cdp_busy_reason(ws_url)
+        if busy_reason:
+            screenshot = _cdp_capture_page_screenshot(screenshot_path, ws_url)
+            answer_url = _cdp_current_url(ws_url)
+            answer_text_path = _write_answer(answer_path, _format_qa_text(question_text, ""))
+            url_text_path = _write_url(url_path, answer_url)
+            return attach_context({
+                "status": "failed",
+                "screenshot_path": screenshot,
+                "answer_text_path": answer_text_path,
+                "answer_url": answer_url,
+                "url_text_path": url_text_path,
+                "search_results_path": "",
+                "search_result_count": "",
+                "search_read_count": "",
+                "stage": "deepseek_busy",
+                "answer_text_length": "",
+                "remark": f"DeepSeek 正在生成其他消息_account={account_id}_port={cdp_port}: {busy_reason}",
+            })
+
+        gate_reason = _cdp_gate_reason(ws_url)
+        if gate_reason:
+            keep_tab_open = True
+            screenshot = _cdp_capture_page_screenshot(screenshot_path, ws_url)
+            answer_url = _cdp_current_url(ws_url)
+            url_text_path = _write_url(url_path, answer_url)
+            return attach_context({
+                "status": "manual_required",
+                "screenshot_path": screenshot,
+                "answer_text_path": "",
+                "answer_url": answer_url,
+                "url_text_path": url_text_path,
+                "search_results_path": "",
+                "search_result_count": "",
+                "search_read_count": "",
+                "remark": f"DeepSeek 触发登录/验证/风控_account={account_id}_port={cdp_port}: {gate_reason}",
+            })
+
+        answer_text = _cdp_wait_answer(ws_url=ws_url)
+        busy_reason = _cdp_busy_reason(ws_url)
+        if busy_reason:
+            screenshot = _cdp_capture_page_screenshot(screenshot_path, ws_url)
+            answer_url = _cdp_current_url(ws_url)
+            answer_text_path = _write_answer(answer_path, _format_qa_text(question_text, answer_text))
+            url_text_path = _write_url(url_path, answer_url)
+            return attach_context({
+                "status": "failed",
+                "screenshot_path": screenshot,
+                "answer_text_path": answer_text_path,
+                "answer_url": answer_url,
+                "url_text_path": url_text_path,
+                "search_results_path": "",
+                "search_result_count": "",
+                "search_read_count": "",
+                "stage": "deepseek_busy",
+                "answer_text_length": len(answer_text),
+                "remark": f"DeepSeek 正在生成其他消息_account={account_id}_port={cdp_port}: {busy_reason}",
+            })
+        _cdp_wait_completion_capture(ws_url=ws_url)
+        answer_url = _cdp_current_url(ws_url)
+        search_fields, search_remark = _capture_search_results(
+            search_results_path, question_text, answer_url, ws_url=ws_url
         )
-        if extracted_text:
-            answer_text = extracted_text
-    except Exception as exc:
-        screenshot = _cdp_capture_page_screenshot(screenshot_path)
-        answer_text_path = _write_answer(answer_path, _format_qa_text(question_text, answer_text))
-        url_text_path = _write_url(url_path, answer_url)
-        if answer_text and screenshot:
-            return {
-                "status": "success",
+        try:
+            screenshot, extracted_text, screenshot_mode = _cdp_capture_deepseek_evidence(
+                screenshot_path, question_text, ws_url=ws_url
+            )
+            if extracted_text:
+                answer_text = extracted_text
+        except Exception as exc:
+            screenshot = _cdp_capture_page_screenshot(screenshot_path, ws_url)
+            answer_text_path = _write_answer(answer_path, _format_qa_text(question_text, answer_text))
+            url_text_path = _write_url(url_path, answer_url)
+            invalid_reason = _invalid_answer_reason(question_text, answer_text)
+            if not invalid_reason and answer_text and screenshot:
+                return attach_context({
+                    "status": "success",
+                    "screenshot_path": screenshot,
+                    "answer_text_path": answer_text_path,
+                    "answer_url": answer_url,
+                    "url_text_path": url_text_path,
+                    **search_fields,
+                    "answer_text_length": len(answer_text),
+                    "remark": _short_remark(f"正常完成_account={account_id}_port={cdp_port}_截图降级: {exc}{search_remark}"),
+                })
+            return attach_context({
+                "status": "failed",
                 "screenshot_path": screenshot,
                 "answer_text_path": answer_text_path,
                 "answer_url": answer_url,
                 "url_text_path": url_text_path,
                 **search_fields,
+                "stage": invalid_reason or "screenshot_failed",
                 "answer_text_length": len(answer_text),
-                "remark": _short_remark(f"正常完成_截图降级: {exc}{search_remark}"),
-            }
-        return {
-            "status": "failed",
+                "remark": _short_remark(f"cdp_screenshot_failed_account={account_id}_port={cdp_port}: {invalid_reason or exc}{search_remark}"),
+            })
+
+        answer_text_path = _write_answer(answer_path, _format_qa_text(question_text, answer_text))
+        url_text_path = _write_url(url_path, answer_url)
+        invalid_reason = _invalid_answer_reason(question_text, answer_text)
+        return attach_context({
+            "status": "failed" if invalid_reason else "success",
             "screenshot_path": screenshot,
             "answer_text_path": answer_text_path,
             "answer_url": answer_url,
             "url_text_path": url_text_path,
             **search_fields,
             "answer_text_length": len(answer_text),
-            "remark": _short_remark(f"cdp_screenshot_failed: {exc}{search_remark}"),
-        }
-
-    answer_text_path = _write_answer(answer_path, _format_qa_text(question_text, answer_text))
-    url_text_path = _write_url(url_path, answer_url)
-    return {
-        "status": "success" if answer_text else "failed",
-        "screenshot_path": screenshot,
-        "answer_text_path": answer_text_path,
-        "answer_url": answer_url,
-        "url_text_path": url_text_path,
-        **search_fields,
-        "answer_text_length": len(answer_text),
-        "screenshot_mode": screenshot_mode,
-        "remark": (
-            f"正常完成_{screenshot_mode}{search_remark}"
-            if answer_text
-            else f"timeout_waiting_answer_{screenshot_mode}_未提取文本{search_remark}"
-        ),
-    }
+            "screenshot_mode": screenshot_mode,
+            "stage": invalid_reason or "",
+            "remark": (
+                f"正常完成_account={account_id}_port={cdp_port}_{screenshot_mode}{search_remark}"
+                if not invalid_reason
+                else f"answer_invalid_account={account_id}_port={cdp_port}_{invalid_reason}_{screenshot_mode}{search_remark}"
+            ),
+        })
+    finally:
+        target_id = str(context.get("target_id") or "")
+        if target_id and not keep_tab_open:
+            _cdp_close_target(target_id, cdp_port=cdp_port)
 
 
 def _now() -> str:
@@ -204,6 +283,46 @@ def _short_remark(message: str, limit: int = 500) -> str:
     return message if len(message) <= limit else message[:limit] + "..."
 
 
+def _task_cdp_port(task: dict) -> int:
+    try:
+        return int(task.get("cdp_port") or CDP_PORT)
+    except Exception:
+        return CDP_PORT
+
+
+def _normalize_for_compare(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip().lower()
+
+
+def _invalid_answer_reason(question: str, answer_text: str) -> str:
+    answer = str(answer_text or "").strip()
+    if not answer:
+        return "empty_answer"
+    compact_answer = _normalize_for_compare(answer)
+    compact_question = _normalize_for_compare(question)
+    if compact_question and compact_answer == compact_question:
+        return "answer_equals_question"
+    if compact_question and compact_answer.endswith(compact_question) and len(compact_answer) <= len(compact_question) + 20:
+        return "answer_only_contains_question"
+    lower_answer = answer.lower()
+    for marker in BUSY_MARKERS:
+        if marker.lower() in lower_answer:
+            return "deepseek_busy"
+    navigation_markers = ("开启新对话", "历史记录", "深度思考", "联网搜索", "发送")
+    marker_hits = sum(1 for marker in navigation_markers if marker in answer)
+    if marker_hits >= 3 and len(answer) < 240:
+        return "navigation_text_only"
+    return ""
+
+
+def _cdp_busy_reason(ws_url: str | None = None) -> str | None:
+    lower = _cdp_page_text(ws_url).lower()
+    for marker in BUSY_MARKERS:
+        if marker.lower() in lower:
+            return marker
+    return None
+
+
 def _safe_path_part(value: str, limit: int = 90) -> str:
     safe = re.sub(r"[\\/:*?\"<>|\r\n\t]+", " ", str(value)).strip()
     safe = re.sub(r"\s+", " ", safe)
@@ -220,7 +339,9 @@ def _make_paths(task: dict) -> tuple[Path, Path, Path, Path]:
     safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(task.get("id") or f"row_{_time_tag()}"))
     platform = str(task.get("platform") or "deepseek")
     round_value = str(task.get("round") or "1")
-    base = f"{safe_id}_{platform}_round{round_value}_{_time_tag()}"
+    task_suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", str(task.get("task_uid") or ""))[-6:]
+    suffix = f"_{task_suffix}" if task_suffix else ""
+    base = f"{safe_id}_{platform}_round{round_value}_{_time_tag()}{suffix}"
     return (
         output_dir / f"{base}.png",
         output_dir / f"{base}.txt",
@@ -251,8 +372,8 @@ def _write_url(url_path: Path, answer_url: str) -> str:
     return str(url_path)
 
 
-def _cdp_install_completion_capture() -> None:
-    ws_url = _cdp_deepseek_ws_url()
+def _cdp_install_completion_capture(ws_url: str | None = None) -> None:
+    ws_url = ws_url or _cdp_deepseek_ws_url()
     if not ws_url:
         return
     expression = r"""
@@ -350,8 +471,8 @@ def _cdp_install_completion_capture() -> None:
         pass
 
 
-def _cdp_wait_completion_capture(timeout_seconds: float = 3.0) -> None:
-    ws_url = _cdp_deepseek_ws_url()
+def _cdp_wait_completion_capture(timeout_seconds: float = 3.0, ws_url: str | None = None) -> None:
+    ws_url = ws_url or _cdp_deepseek_ws_url()
     if not ws_url:
         return
     deadline = time.time() + timeout_seconds
@@ -392,10 +513,10 @@ def _write_search_results(search_results_path: Path, payload: dict) -> dict[str,
 
 
 def _capture_search_results(
-    search_results_path: Path, question: str, answer_url: str
+    search_results_path: Path, question: str, answer_url: str, ws_url: str | None = None
 ) -> tuple[dict[str, str | int], str]:
     try:
-        payload = _cdp_extract_search_results(question, answer_url)
+        payload = _cdp_extract_search_results(question, answer_url, ws_url=ws_url)
     except Exception as exc:
         payload = {
             "schema_version": 1,
@@ -420,8 +541,8 @@ def _capture_search_results(
     return fields, ""
 
 
-def _cdp_extract_search_results(question: str, answer_url: str) -> dict:
-    ws_url = _cdp_deepseek_ws_url()
+def _cdp_extract_search_results(question: str, answer_url: str, ws_url: str | None = None) -> dict:
+    ws_url = ws_url or _cdp_deepseek_ws_url()
     if not ws_url:
         raise RuntimeError("cdp_not_available")
     expression = r"""
@@ -847,38 +968,79 @@ class _CdpWebSocket:
             return message.get("result") or {}
 
 
-def _cdp_json(path: str, timeout: int = 2, method: str = "GET"):
-    url = f"http://{CDP_HOST}:{CDP_PORT}{path}"
+def _cdp_json(path: str, timeout: int = 2, method: str = "GET", cdp_port: int | None = None):
+    port = int(cdp_port or CDP_PORT)
+    url = f"http://{CDP_HOST}:{port}{path}"
     request = urllib.request.Request(url, method=method)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _cdp_is_available() -> bool:
+def _cdp_is_available(cdp_port: int | None = None) -> bool:
     try:
-        _cdp_json("/json/version")
+        _cdp_json("/json/version", cdp_port=cdp_port)
         return True
     except Exception:
         return False
 
 
-def _cdp_targets() -> list[dict]:
+def cdp_is_available(cdp_port: int | None = None) -> bool:
+    return _cdp_is_available(cdp_port)
+
+
+def cdp_ensure_deepseek_page(cdp_port: int | None = None) -> bool:
+    return bool(_cdp_deepseek_ws_url(open_if_missing=True, cdp_port=cdp_port))
+
+
+def cdp_account_status(cdp_port: int | None = None) -> dict:
+    port = int(cdp_port or CDP_PORT)
+    available = _cdp_is_available(port)
+    if not available:
+        return {
+            "cdp_available": False,
+            "deepseek_open": False,
+            "ready": False,
+            "current_url": "",
+            "gate_reason": "cdp_not_available",
+        }
+    ws_url = _cdp_deepseek_ws_url(open_if_missing=False, cdp_port=port)
+    if not ws_url:
+        return {
+            "cdp_available": True,
+            "deepseek_open": False,
+            "ready": False,
+            "current_url": "",
+            "gate_reason": "deepseek_page_not_open",
+        }
+    current_url = _cdp_current_url(ws_url)
+    gate_reason = _cdp_gate_reason(ws_url)
+    ready = bool(current_url) and "chat.deepseek.com" in current_url and not gate_reason
+    return {
+        "cdp_available": True,
+        "deepseek_open": True,
+        "ready": ready,
+        "current_url": current_url,
+        "gate_reason": gate_reason or "",
+    }
+
+
+def _cdp_targets(cdp_port: int | None = None) -> list[dict]:
     try:
-        targets = _cdp_json("/json/list")
+        targets = _cdp_json("/json/list", cdp_port=cdp_port)
     except Exception:
         return []
     return targets if isinstance(targets, list) else []
 
 
-def _cdp_deepseek_ws_url(open_if_missing: bool = False) -> str | None:
-    targets = _cdp_targets()
+def _cdp_deepseek_ws_url(open_if_missing: bool = False, cdp_port: int | None = None) -> str | None:
+    targets = _cdp_targets(cdp_port=cdp_port)
     for target in targets:
         url = target.get("url") or ""
         if "chat.deepseek.com" in url and target.get("webSocketDebuggerUrl"):
             return target["webSocketDebuggerUrl"]
     if open_if_missing:
         try:
-            created = _cdp_json(f"/json/new?{quote(DEEPSEEK_URL, safe='')}", method="PUT")
+            created = _cdp_json(f"/json/new?{quote(DEEPSEEK_URL, safe='')}", method="PUT", cdp_port=cdp_port)
             if created.get("webSocketDebuggerUrl"):
                 return created["webSocketDebuggerUrl"]
         except Exception:
@@ -886,33 +1048,37 @@ def _cdp_deepseek_ws_url(open_if_missing: bool = False) -> str | None:
     return None
 
 
-def _cdp_close_target(target_id: str) -> None:
+def _cdp_close_target(target_id: str, cdp_port: int | None = None) -> None:
     try:
-        url = f"http://{CDP_HOST}:{CDP_PORT}/json/close/{quote(target_id, safe='')}"
+        port = int(cdp_port or CDP_PORT)
+        url = f"http://{CDP_HOST}:{port}/json/close/{quote(target_id, safe='')}"
         with urllib.request.urlopen(url, timeout=3) as response:
             response.read()
     except Exception:
         pass
 
 
-def _cdp_close_deepseek_pages() -> None:
-    for target in _cdp_targets():
+def _cdp_close_deepseek_pages(cdp_port: int | None = None) -> None:
+    for target in _cdp_targets(cdp_port=cdp_port):
         if target.get("type") != "page":
             continue
         if "chat.deepseek.com" not in (target.get("url") or ""):
             continue
         target_id = target.get("id")
         if target_id:
-            _cdp_close_target(target_id)
+            _cdp_close_target(target_id, cdp_port=cdp_port)
     time.sleep(0.8)
 
 
-def _cdp_new_deepseek_page() -> str | None:
+def _cdp_new_deepseek_page(cdp_port: int | None = None) -> dict | None:
     for encoded_url in (quote(DEEPSEEK_URL, safe=""), DEEPSEEK_URL):
         try:
-            created = _cdp_json(f"/json/new?{encoded_url}", timeout=5, method="PUT")
+            created = _cdp_json(f"/json/new?{encoded_url}", timeout=5, method="PUT", cdp_port=cdp_port)
             if created.get("webSocketDebuggerUrl"):
-                return created["webSocketDebuggerUrl"]
+                return {
+                    "ws_url": created["webSocketDebuggerUrl"],
+                    "target_id": created.get("id") or "",
+                }
         except Exception:
             pass
     return None
@@ -940,14 +1106,15 @@ def _cdp_bring_to_front(cdp: _CdpWebSocket) -> None:
         cdp.send_cmd("Page.bringToFront")
 
 
-def _cdp_open_deepseek(fresh: bool = False) -> str:
+def _cdp_open_deepseek(fresh: bool = False, cdp_port: int | None = None) -> dict:
     if fresh:
-        _cdp_close_deepseek_pages()
-        ws_url = _cdp_new_deepseek_page()
+        created = _cdp_new_deepseek_page(cdp_port=cdp_port)
     else:
-        ws_url = _cdp_deepseek_ws_url(open_if_missing=True)
+        ws_url = _cdp_deepseek_ws_url(open_if_missing=True, cdp_port=cdp_port)
+        created = {"ws_url": ws_url or "", "target_id": ""}
+    ws_url = str((created or {}).get("ws_url") or "")
     if not ws_url:
-        raise RuntimeError("cdp_not_available_请先运行 yingdao_mvp/start_chrome_cdp.command")
+        raise RuntimeError(f"cdp_not_available_port_{int(cdp_port or CDP_PORT)}_请先运行 start_chrome_cdp_multi.command")
     with _CdpWebSocket(ws_url) as cdp:
         cdp.send_cmd("Page.enable")
         cdp.send_cmd("Runtime.enable")
@@ -956,11 +1123,11 @@ def _cdp_open_deepseek(fresh: bool = False) -> str:
         if "chat.deepseek.com" not in current_url:
             cdp.send_cmd("Page.navigate", {"url": DEEPSEEK_URL})
             time.sleep(5)
-    return ws_url
+    return created or {"ws_url": ws_url, "target_id": ""}
 
 
-def _cdp_page_text() -> str:
-    ws_url = _cdp_deepseek_ws_url()
+def _cdp_page_text(ws_url: str | None = None) -> str:
+    ws_url = ws_url or _cdp_deepseek_ws_url()
     if not ws_url:
         return ""
     try:
@@ -971,8 +1138,8 @@ def _cdp_page_text() -> str:
         return ""
 
 
-def _cdp_current_url() -> str:
-    ws_url = _cdp_deepseek_ws_url()
+def _cdp_current_url(ws_url: str | None = None) -> str:
+    ws_url = ws_url or _cdp_deepseek_ws_url()
     if not ws_url:
         return ""
     try:
@@ -983,19 +1150,19 @@ def _cdp_current_url() -> str:
         return ""
 
 
-def _cdp_gate_reason() -> str | None:
-    url = _cdp_current_url().lower()
+def _cdp_gate_reason(ws_url: str | None = None) -> str | None:
+    url = _cdp_current_url(ws_url).lower()
     if "/sign" in url or "/login" in url:
         return "login_url"
-    lower = _cdp_page_text().lower()
+    lower = _cdp_page_text(ws_url).lower()
     for marker in GATE_MARKERS:
         if marker.lower() in lower:
             return marker
     return None
 
 
-def _cdp_submit_question(question: str) -> bool:
-    ws_url = _cdp_deepseek_ws_url()
+def _cdp_submit_question(question: str, ws_url: str | None = None) -> bool:
+    ws_url = ws_url or _cdp_deepseek_ws_url()
     if not ws_url:
         return False
 
@@ -1083,8 +1250,8 @@ def _cdp_submit_question(question: str) -> bool:
         return False
 
 
-def _cdp_answer_state() -> dict:
-    ws_url = _cdp_deepseek_ws_url()
+def _cdp_answer_state(ws_url: str | None = None) -> dict:
+    ws_url = ws_url or _cdp_deepseek_ws_url()
     if not ws_url:
         return {"answerText": "", "generating": False}
     expression = r"""
@@ -1121,14 +1288,14 @@ def _cdp_answer_state() -> dict:
         return {"answerText": "", "generating": False}
 
 
-def _cdp_wait_answer(timeout_seconds: int = ANSWER_TIMEOUT_SECONDS) -> str:
+def _cdp_wait_answer(timeout_seconds: int = ANSWER_TIMEOUT_SECONDS, ws_url: str | None = None) -> str:
     deadline = time.time() + timeout_seconds
     started_at = time.time()
     last_text = ""
     stable_since = time.time()
     best_text = ""
     while time.time() < deadline:
-        state = _cdp_answer_state()
+        state = _cdp_answer_state(ws_url)
         text = str(state.get("answerText") or "").strip()
         generating = bool(state.get("generating"))
         if text:
@@ -1144,18 +1311,15 @@ def _cdp_wait_answer(timeout_seconds: int = ANSWER_TIMEOUT_SECONDS) -> str:
     return best_text
 
 
-def _cdp_capture_page_screenshot(screenshot_path: Path) -> str:
-    ws_url = _cdp_deepseek_ws_url()
+def _cdp_capture_page_screenshot(screenshot_path: Path, ws_url: str | None = None) -> str:
+    ws_url = ws_url or _cdp_deepseek_ws_url()
     if not ws_url:
         return _desktop_screenshot(screenshot_path)
     screenshot_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with _CdpWebSocket(ws_url) as cdp:
             cdp.send_cmd("Page.enable")
-            try:
-                cdp.send_cmd("Page.bringToFront")
-            except Exception:
-                pass
+            _cdp_bring_to_front(cdp)
             metrics = cdp.send_cmd("Page.getLayoutMetrics")
             content_size = metrics.get("contentSize") or {}
             width = max(1, int(content_size.get("width") or 1400))
@@ -1382,11 +1546,11 @@ def _best_vertical_overlap(previous_image, current_image, expected_overlap: int)
     return best_overlap
 
 
-def _cdp_capture_scroll_stitched_evidence(screenshot_path: Path) -> tuple[str, int]:
+def _cdp_capture_scroll_stitched_evidence(screenshot_path: Path, ws_url: str | None = None) -> tuple[str, int]:
     from io import BytesIO
     from PIL import Image
 
-    ws_url = _cdp_deepseek_ws_url()
+    ws_url = ws_url or _cdp_deepseek_ws_url()
     if not ws_url:
         raise RuntimeError("cdp_not_available")
     screenshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1461,8 +1625,10 @@ def _cdp_capture_scroll_stitched_evidence(screenshot_path: Path) -> tuple[str, i
     return str(screenshot_path), len(chunks)
 
 
-def _cdp_capture_deepseek_evidence(screenshot_path: Path, question: str) -> tuple[str, str, str]:
-    ws_url = _cdp_deepseek_ws_url()
+def _cdp_capture_deepseek_evidence(
+    screenshot_path: Path, question: str, ws_url: str | None = None
+) -> tuple[str, str, str]:
+    ws_url = ws_url or _cdp_deepseek_ws_url()
     if not ws_url:
         raise RuntimeError("cdp_not_available")
 
@@ -1608,7 +1774,7 @@ def _cdp_capture_deepseek_evidence(screenshot_path: Path, question: str) -> tupl
             except Exception:
                 pass
             try:
-                screenshot, pages = _cdp_capture_scroll_stitched_evidence(screenshot_path)
+                screenshot, pages = _cdp_capture_scroll_stitched_evidence(screenshot_path, ws_url)
                 return screenshot, answer_text, f"CDP真实页面滚动拼接_pages={pages}"
             except Exception:
                 result = cdp.send_cmd("Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True})
@@ -1657,21 +1823,40 @@ def _add_timestamp_to_image(image_path: Path, captured_at: str | None = None) ->
     try:
         image = Image.open(image_path).convert("RGBA")
         draw = ImageDraw.Draw(image)
-        font = _load_cjk_font(max(18, min(28, image.width // 70)))
-        padding_x = 18
-        padding_y = 10
-        margin = 24
+        font = _load_cjk_font(max(22, min(34, image.width // 62)))
+        padding_x = 22
+        padding_y = 13
+        margin = 26
         bbox = draw.textbbox((0, 0), label, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
         box_width = text_width + padding_x * 2
         box_height = text_height + padding_y * 2
-        x1 = max(margin, image.width - box_width - margin)
+        x1 = margin
         y1 = margin
         x2 = x1 + box_width
         y2 = y1 + box_height
-        draw.rounded_rectangle((x1, y1, x2, y2), radius=10, fill=(255, 255, 255, 225), outline=(209, 213, 219, 230), width=1)
-        draw.text((x1 + padding_x, y1 + padding_y), label, fill=(17, 24, 39, 255), font=font)
+        shadow_offset = 5
+        draw.rounded_rectangle(
+            (x1 + shadow_offset, y1 + shadow_offset, x2 + shadow_offset, y2 + shadow_offset),
+            radius=12,
+            fill=(15, 23, 42, 70),
+        )
+        draw.rounded_rectangle(
+            (x1, y1, x2, y2),
+            radius=12,
+            fill=(15, 23, 42, 242),
+            outline=(37, 99, 235, 255),
+            width=3,
+        )
+        stripe_width = 8
+        draw.rounded_rectangle(
+            (x1, y1, x1 + stripe_width + 8, y2),
+            radius=12,
+            fill=(37, 99, 235, 255),
+        )
+        draw.rectangle((x1 + stripe_width, y1, x1 + stripe_width + 8, y2), fill=(37, 99, 235, 255))
+        draw.text((x1 + padding_x + stripe_width, y1 + padding_y), label, fill=(255, 255, 255, 255), font=font)
         image.convert("RGB").save(image_path)
     except Exception:
         pass
