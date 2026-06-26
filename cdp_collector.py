@@ -95,6 +95,7 @@ def _run_deepseek_cdp(
             "remark": f"DeepSeek 触发登录/验证/风控: {gate_reason}",
         }
 
+    _cdp_install_completion_capture()
     if not _cdp_submit_question(question_text):
         screenshot = _cdp_capture_page_screenshot(screenshot_path)
         answer_url = _cdp_current_url()
@@ -130,6 +131,7 @@ def _run_deepseek_cdp(
         }
 
     answer_text = _cdp_wait_answer()
+    _cdp_wait_completion_capture()
     answer_url = _cdp_current_url()
     search_fields, search_remark = _capture_search_results(
         search_results_path, question_text, answer_url
@@ -249,6 +251,131 @@ def _write_url(url_path: Path, answer_url: str) -> str:
     return str(url_path)
 
 
+def _cdp_install_completion_capture() -> None:
+    ws_url = _cdp_deepseek_ws_url()
+    if not ws_url:
+        return
+    expression = r"""
+    (() => {
+      if (window.__geoCompletionCaptureInstalled === 2) {
+        window.__geoCompletionRecords = [];
+        return true;
+      }
+      window.__geoCompletionCaptureInstalled = 2;
+      window.__geoCompletionRecords = [];
+      const recordCompletionBody = record => {
+        window.__geoCompletionRecords.push(record);
+        return record;
+      };
+      const originalFetch = window.__geoOriginalFetch || window.fetch.bind(window);
+      window.__geoOriginalFetch = originalFetch;
+      window.fetch = async function (...args) {
+        const input = args[0];
+        const url = typeof input === 'string' ? input : ((input && input.url) || '');
+        const response = await originalFetch(...args);
+        if (String(url).includes('/api/v0/chat/completion')) {
+          const record = recordCompletionBody({
+            transport: 'fetch',
+            url: String(url),
+            status: response.status,
+            started_at: new Date().toISOString(),
+            finished_at: '',
+            done: false,
+            error: '',
+            body: '',
+          });
+          try {
+            const cloned = response.clone();
+            cloned.text().then(text => {
+              record.body = text || '';
+              record.done = true;
+              record.finished_at = new Date().toISOString();
+            }).catch(error => {
+              record.error = String(error && error.message || error || 'completion_clone_failed');
+              record.done = true;
+              record.finished_at = new Date().toISOString();
+            });
+          } catch (error) {
+            record.error = String(error && error.message || error || 'completion_clone_failed');
+            record.done = true;
+            record.finished_at = new Date().toISOString();
+          }
+        }
+        return response;
+      };
+      const OriginalXHR = window.__geoOriginalXMLHttpRequest || window.XMLHttpRequest;
+      window.__geoOriginalXMLHttpRequest = OriginalXHR;
+      window.XMLHttpRequest = function () {
+        const xhr = new OriginalXHR();
+        let requestUrl = '';
+        let requestMethod = '';
+        const originalOpen = xhr.open;
+        xhr.open = function (method, url, ...rest) {
+          requestMethod = String(method || '');
+          requestUrl = String(url || '');
+          return originalOpen.call(xhr, method, url, ...rest);
+        };
+        xhr.addEventListener('loadend', () => {
+          if (!requestUrl.includes('/api/v0/chat/completion')) return;
+          const record = recordCompletionBody({
+            transport: 'xhr',
+            method: requestMethod,
+            url: requestUrl,
+            status: xhr.status,
+            started_at: '',
+            finished_at: new Date().toISOString(),
+            done: true,
+            error: '',
+            body: '',
+          });
+          try {
+            if (typeof xhr.responseText === 'string') record.body = xhr.responseText || '';
+            else if (typeof xhr.response === 'string') record.body = xhr.response || '';
+            else record.error = 'xhr_response_not_text';
+          } catch (error) {
+            record.error = String(error && error.message || error || 'xhr_capture_failed');
+          }
+        });
+        return xhr;
+      };
+      window.XMLHttpRequest.prototype = OriginalXHR.prototype;
+      return true;
+    })()
+    """
+    try:
+        with _CdpWebSocket(ws_url) as cdp:
+            cdp.send_cmd("Runtime.enable")
+            _cdp_evaluate(cdp, expression, await_promise=False)
+    except Exception:
+        pass
+
+
+def _cdp_wait_completion_capture(timeout_seconds: float = 3.0) -> None:
+    ws_url = _cdp_deepseek_ws_url()
+    if not ws_url:
+        return
+    deadline = time.time() + timeout_seconds
+    expression = r"""
+    (() => {
+      const records = Array.isArray(window.__geoCompletionRecords) ? window.__geoCompletionRecords : [];
+      return JSON.stringify({
+        count: records.length,
+        done: records.length > 0 && records.every(record => record.done),
+      });
+    })()
+    """
+    while time.time() < deadline:
+        try:
+            with _CdpWebSocket(ws_url) as cdp:
+                cdp.send_cmd("Runtime.enable")
+                state = json.loads(_cdp_evaluate(cdp, expression) or "{}")
+            if state.get("done"):
+                return
+        except Exception:
+            return
+        time.sleep(0.3)
+
+
 def _write_search_results(search_results_path: Path, payload: dict) -> dict[str, str | int]:
     search_results_path.parent.mkdir(parents=True, exist_ok=True)
     search_results_path.write_text(
@@ -272,8 +399,8 @@ def _capture_search_results(
     except Exception as exc:
         payload = {
             "schema_version": 1,
-            "parser_version": 2,
-            "parse_method": "search_panel_card_dom",
+            "parser_version": 3,
+            "parse_method": "completion_fetch_capture",
             "captured_at": _now(),
             "question": question,
             "answer_url": answer_url,
@@ -311,6 +438,108 @@ def _cdp_extract_search_results(question: str, answer_url: str) -> dict:
         try { return new URL(href, location.href).href; } catch (_) { return href || ''; }
       };
       const datePattern = /\b\d{4}[\/-]\d{1,2}[\/-]\d{1,2}\b/;
+      const sourceFromUrl = url => {
+        try { return new URL(url).hostname.replace(/^www\./, '').replace(/^m\./, ''); } catch (_) { return ''; }
+      };
+      const getStringByKeys = (obj, keys) => {
+        for (const key of keys) {
+          const value = obj && obj[key];
+          if (typeof value === 'string' && compact(value)) return compact(value);
+          if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+        }
+        return '';
+      };
+      const collectStrings = (value, output = [], depth = 0) => {
+        if (output.length > 300 || depth > 5 || value == null) return output;
+        if (typeof value === 'string') {
+          const text = compact(value);
+          if (text) output.push(text);
+          return output;
+        }
+        if (Array.isArray(value)) {
+          for (const item of value) collectStrings(item, output, depth + 1);
+          return output;
+        }
+        if (typeof value === 'object') {
+          for (const item of Object.values(value)) collectStrings(item, output, depth + 1);
+        }
+        return output;
+      };
+      const parseStreamJsonItems = body => {
+        const items = [];
+        for (let line of String(body || '').split(/\r?\n/)) {
+          line = line.trim();
+          if (!line) continue;
+          if (line.startsWith('data:')) line = line.slice(5).trim();
+          if (!line || line === '[DONE]') continue;
+          if (!line.startsWith('{') && !line.startsWith('[')) continue;
+          try {
+            const parsed = JSON.parse(line);
+            if (Array.isArray(parsed)) items.push(...parsed);
+            else items.push(parsed);
+          } catch (_) {}
+        }
+        return items;
+      };
+      const normalizeCapturedResult = obj => {
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+        const url = getStringByKeys(obj, ['url', 'href', 'link', 'web_url', 'source_url', 'site_url', 'redirect_url']);
+        if (!/^https?:\/\//i.test(url)) return null;
+        if (/cdn\.deepseek\.com\/site-icons/i.test(url)) return null;
+        const title = getStringByKeys(obj, ['title', 'web_title', 'site_title', 'name', 'display_title', 'doc_title']);
+        const snippet = getStringByKeys(obj, ['snippet', 'summary', 'description', 'abstract', 'content', 'text', 'quote']);
+        let source = getStringByKeys(obj, ['source', 'source_name', 'site', 'site_name', 'media', 'publisher', 'domain', 'hostname']);
+        const allText = collectStrings(obj);
+        let date = getStringByKeys(obj, ['date', 'publish_date', 'published_date', 'publish_time', 'published_at', 'time']);
+        const dateMatch = (date || allText.find(text => datePattern.test(text)) || '').match(datePattern);
+        date = dateMatch ? dateMatch[0] : '';
+        if (!source) {
+          const dateLine = allText.find(text => date && text.includes(date)) || '';
+          source = compact(dateLine.split(date)[0] || '').replace(/[|｜·•-]+$/g, '').trim();
+        }
+        if (!source) source = sourceFromUrl(url);
+        if (!title && !snippet) return null;
+        const rankText = getStringByKeys(obj, ['rank', 'index', 'position', 'seq', 'number']);
+        const rank = /^\d+$/.test(rankText) ? Number(rankText) : 0;
+        return { rank, source, date, title, url, snippet, raw_text: JSON.stringify(obj).slice(0, 4000) };
+      };
+      const collectCapturedResults = value => {
+        const results = [];
+        const visit = (item, depth = 0) => {
+          if (results.length > 80 || depth > 8 || item == null) return;
+          if (Array.isArray(item)) {
+            for (const child of item) visit(child, depth + 1);
+            return;
+          }
+          if (typeof item === 'string') {
+            const text = item.trim();
+            if (text.startsWith('{') || text.startsWith('[')) {
+              try { visit(JSON.parse(text), depth + 1); } catch (_) {}
+            }
+            return;
+          }
+          if (typeof item !== 'object') return;
+          const normalized = normalizeCapturedResult(item);
+          if (normalized) results.push(normalized);
+          for (const child of Object.values(item)) visit(child, depth + 1);
+        };
+        visit(value);
+        return results;
+      };
+      const parseCompletionCaptureResults = () => {
+        const records = Array.isArray(window.__geoCompletionRecords) ? window.__geoCompletionRecords : [];
+        const parsed = [];
+        for (const record of records) {
+          for (const item of parseStreamJsonItems(record && record.body)) {
+            parsed.push(...collectCapturedResults(item));
+          }
+        }
+        return {
+          records,
+          results: parsed,
+          done: records.length > 0 && records.every(record => record.done),
+        };
+      };
       const bodyText = clean(document.body ? document.body.innerText : '');
       const readMatch = bodyText.match(/已阅读\s*(\d+)\s*个网页/);
       const readCountText = readMatch ? readMatch[0] : '';
@@ -360,15 +589,26 @@ def _cdp_extract_search_results(question: str, answer_url: str) -> dict:
         return true;
       };
 
-      let panel = findSearchPanel();
-      let panel_revealed = false;
-      if (!panel && readMatch) {
-        panel_revealed = await revealSearchPanel();
-        panel = findSearchPanel();
-      }
+      const captured = parseCompletionCaptureResults();
       const seenUrls = new Set();
       const results = [];
-      if (panel) {
+      for (const item of captured.results) {
+        if (!item.url || seenUrls.has(item.url)) continue;
+        seenUrls.add(item.url);
+        results.push({ ...item, rank: item.rank || results.length + 1 });
+      }
+
+      let panel = null;
+      let panel_revealed = false;
+      let parseMethod = results.length ? 'completion_fetch_capture' : 'search_panel_card_dom';
+      if (!results.length) {
+        panel = findSearchPanel();
+        if (!panel && readMatch) {
+          panel_revealed = await revealSearchPanel();
+          panel = findSearchPanel();
+        }
+      }
+      if (!results.length && panel) {
         const anchors = Array.from(panel.querySelectorAll('a[href]')).filter(a => /^https?:/i.test(absoluteUrl(a.getAttribute('href') || a.href || '')));
         for (const anchor of anchors) {
           const url = absoluteUrl(anchor.getAttribute('href') || anchor.href || '');
@@ -461,8 +701,13 @@ def _cdp_extract_search_results(question: str, answer_url: str) -> dict:
 
       const extractionStatus = results.length || readCount !== null || citationLinks.length ? 'success' : 'not_found';
       return JSON.stringify({
-        parser_version: 2,
-        parse_method: 'search_panel_card_dom',
+        parser_version: 3,
+        parse_method: parseMethod,
+        completion_capture_count: captured.records.length,
+        completion_capture_done: captured.done,
+        completion_capture_transports: captured.records.map(record => record.transport || ''),
+        completion_capture_body_lengths: captured.records.map(record => String(record.body || '').length),
+        completion_capture_errors: captured.records.map(record => record.error || '').filter(Boolean),
         search_panel_revealed: panel_revealed,
         search_panel_found: Boolean(panel),
         read_count: readCount,
@@ -483,8 +728,8 @@ def _cdp_extract_search_results(question: str, answer_url: str) -> dict:
     data.setdefault("extraction_status", "not_found")
     return {
         "schema_version": 1,
-        "parser_version": 2,
-        "parse_method": "search_panel_card_dom",
+        "parser_version": 3,
+        "parse_method": str(data.get("parse_method") or "completion_fetch_capture"),
         "captured_at": _now(),
         "question": question,
         "answer_url": answer_url,
