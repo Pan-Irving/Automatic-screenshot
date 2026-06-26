@@ -25,8 +25,9 @@ TASKS_PATH = RUNTIME_DIR / "tasks.json"
 EVENTS_PATH = RUNTIME_DIR / "events.jsonl"
 EXPORT_PATH = RUNTIME_DIR / "exported_tasks.xlsx"
 RESULTS_DIR = BASE_DIR / "yingdao_results"
-TASK_DELAY_SECONDS = int(os.getenv("YINGDAO_TASK_DELAY_SECONDS", "10"))
-TASK_DELAY_RANDOM_SECONDS = int(os.getenv("YINGDAO_TASK_DELAY_RANDOM_SECONDS", "10"))
+TASK_DELAY_SECONDS = int(os.getenv("YINGDAO_TASK_DELAY_SECONDS", "3"))
+TASK_DELAY_RANDOM_SECONDS = int(os.getenv("YINGDAO_TASK_DELAY_RANDOM_SECONDS", "5"))
+COLLECTOR_MODE = os.getenv("YINGDAO_COLLECTOR", "cdp").strip().lower()
 
 STATUSES_EXECUTED = {"success", "failed", "manual_required"}
 
@@ -89,6 +90,14 @@ def normalize_task(raw: dict[str, Any], index: int) -> dict[str, Any]:
         "answer_text_path": str(raw.get("answer_text_path") or ""),
         "answer_url": str(raw.get("answer_url") or ""),
         "url_text_path": str(raw.get("url_text_path") or ""),
+        "search_results_path": str(raw.get("search_results_path") or ""),
+        "search_result_count": raw.get("search_result_count") or "",
+        "search_read_count": raw.get("search_read_count") or "",
+        "html_path": str(raw.get("html_path") or ""),
+        "stage": str(raw.get("stage") or ""),
+        "answer_text_length": raw.get("answer_text_length") or "",
+        "screenshot_mode": str(raw.get("screenshot_mode") or ""),
+        "collector": str(raw.get("collector") or ""),
         "remark": str(raw.get("remark") or ""),
         "error": "",
         "attempt_count": 0,
@@ -110,9 +119,12 @@ def make_task_uid(raw: dict[str, Any], index: int) -> str:
 
 
 def task_summary() -> dict[str, Any]:
+    global _pause_requested
     with _state_lock:
         tasks = load_tasks()
         runner_alive = _runner_thread is not None and _runner_thread.is_alive()
+        if not runner_alive and _pause_requested:
+            _pause_requested = False
         current = next((task for task in tasks if task.get("status") == "running"), None)
         pending = [task for task in tasks if task.get("status") == "pending"]
         executed = [task for task in tasks if task.get("status") in STATUSES_EXECUTED]
@@ -122,6 +134,7 @@ def task_summary() -> dict[str, Any]:
                 "pause_requested": _pause_requested,
                 "task_delay_seconds": TASK_DELAY_SECONDS,
                 "task_delay_random_seconds": TASK_DELAY_RANDOM_SECONDS,
+                "collector_mode": COLLECTOR_MODE,
             },
             "current": current,
             "pending": pending,
@@ -149,6 +162,12 @@ def update_task(task_uid: str, updates: dict[str, Any]) -> dict[str, Any]:
             save_tasks(tasks)
             return task
     raise KeyError(task_uid)
+
+
+def collect_deepseek(task: dict[str, Any]) -> dict[str, Any]:
+    result = cdp_collector.run_deepseek(task)
+    result["collector"] = "cdp"
+    return result
 
 
 def run_pending_tasks() -> None:
@@ -190,7 +209,7 @@ def run_pending_tasks() -> None:
             append_event("task_started", {"task_uid": task_uid, "id": task.get("id")})
             started_seconds = time.time()
             try:
-                result = cdp_collector.run_deepseek(task)
+                result = collect_deepseek(task)
             except Exception as exc:
                 result = {
                     "status": "failed",
@@ -198,6 +217,14 @@ def run_pending_tasks() -> None:
                     "answer_text_path": "",
                     "answer_url": "",
                     "url_text_path": "",
+                    "search_results_path": "",
+                    "search_result_count": "",
+                    "search_read_count": "",
+                    "html_path": "",
+                    "stage": "collector_exception",
+                    "answer_text_length": "",
+                    "screenshot_mode": "",
+                    "collector": COLLECTOR_MODE,
                     "remark": f"run_deepseek_failed: {exc}",
                     "error": str(exc),
                 }
@@ -212,6 +239,14 @@ def run_pending_tasks() -> None:
                 "answer_text_path": result.get("answer_text_path") or "",
                 "answer_url": result.get("answer_url") or "",
                 "url_text_path": result.get("url_text_path") or "",
+                "search_results_path": result.get("search_results_path") or "",
+                "search_result_count": result.get("search_result_count") or "",
+                "search_read_count": result.get("search_read_count") or "",
+                "html_path": result.get("html_path") or "",
+                "stage": result.get("stage") or "",
+                "answer_text_length": result.get("answer_text_length") or "",
+                "screenshot_mode": result.get("screenshot_mode") or "",
+                "collector": result.get("collector") or "",
                 "remark": result.get("remark") or "",
                 "error": result.get("error") or "",
             }
@@ -294,6 +329,18 @@ def api_run() -> dict[str, Any]:
     with _state_lock:
         if _runner_thread is not None and _runner_thread.is_alive():
             return {"ok": False, "message": "已有采集任务正在运行"}
+        tasks = load_tasks()
+        if not tasks:
+            return {"ok": False, "message": "还没有导入任务。请先点击“导入默认 Excel”，或选择文件后点击“上传导入”。"}
+        pending = [
+            task
+            for task in tasks
+            if task.get("status") == "pending"
+            and task.get("platform") == "deepseek"
+            and task.get("question")
+        ]
+        if not pending:
+            return {"ok": False, "message": "没有可执行的 pending/deepseek 任务。请先导入任务，或把需要重跑的任务重新排队。"}
         _pause_requested = False
         _runner_thread = threading.Thread(target=run_pending_tasks, name="yingdao-runner", daemon=True)
         _runner_thread.start()
@@ -304,6 +351,10 @@ def api_run() -> dict[str, Any]:
 def api_pause() -> dict[str, Any]:
     global _pause_requested
     with _state_lock:
+        runner_alive = _runner_thread is not None and _runner_thread.is_alive()
+        if not runner_alive:
+            _pause_requested = False
+            return {"ok": True, "message": "后台未运行，无需暂停"}
         _pause_requested = True
     append_event("pause_requested", {})
     return {"ok": True, "message": "已请求暂停；当前任务会先跑完"}
@@ -325,6 +376,12 @@ def api_retry(task_uid: str) -> dict[str, Any]:
                 "started_at": "",
                 "finished_at": "",
                 "duration_seconds": "",
+                "stage": "",
+                "answer_text_length": "",
+                "screenshot_mode": "",
+                "search_results_path": "",
+                "search_result_count": "",
+                "search_read_count": "",
                 "remark": "已重新排队",
                 "error": "",
             },
@@ -770,10 +827,18 @@ INDEX_HTML = """
         ${detailRow('完成时间', task.finished_at)}
         ${detailRow('耗时', task.duration_seconds ? task.duration_seconds + ' 秒' : '')}
         ${detailRow('执行次数', task.attempt_count)}
+        ${detailRow('采集器', task.collector)}
+        ${detailRow('阶段', task.stage)}
+        ${detailRow('文本长度', task.answer_text_length)}
+        ${detailRow('截图模式', task.screenshot_mode)}
+        ${detailRow('搜索已读网页数', task.search_read_count)}
+        ${detailRow('搜索结果数量', task.search_result_count)}
         ${detailRow('截图路径', fileLink(task.screenshot_path), true)}
         ${detailRow('回答文本', fileLink(task.answer_text_path), true)}
         ${detailRow('对话链接', task.answer_url ? `<a href="${escapeHtml(task.answer_url)}" target="_blank">${escapeHtml(task.answer_url)}</a>` : '', true)}
         ${detailRow('链接文件', fileLink(task.url_text_path), true)}
+        ${detailRow('搜索结果 JSON', fileLink(task.search_results_path), true)}
+        ${detailRow('HTML 片段', fileLink(task.html_path), true)}
         ${detailRow('备注', task.remark)}
         ${detailRow('错误', task.error)}
       `;
@@ -837,15 +902,26 @@ INDEX_HTML = """
     }
 
     document.getElementById('importDefaultBtn').onclick = async () => {
-      await api('/api/import-default', { method: 'POST' });
+      const result = await api('/api/import-default', { method: 'POST' });
       selectedTaskUid = null;
       await refresh();
+      const banner = document.getElementById('runnerBanner');
+      banner.textContent = `已导入 ${result.count || 0} 条任务，可以开始采集。`;
+      banner.className = 'runner-banner paused';
+    };
+
+    document.getElementById('fileInput').onchange = () => {
+      const file = document.getElementById('fileInput').files[0];
+      const banner = document.getElementById('runnerBanner');
+      if (!file) return;
+      banner.textContent = `已选择 ${file.name}，还需要点击“上传导入”才会进入任务列表。`;
+      banner.className = 'runner-banner pause-requested';
     };
 
     document.getElementById('uploadBtn').onclick = async () => {
       const file = document.getElementById('fileInput').files[0];
       if (!file) return alert('请选择 .xlsx 文件');
-      await api('/api/import-excel', {
+      const result = await api('/api/import-excel', {
         method: 'POST',
         headers: {
           'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -855,11 +931,19 @@ INDEX_HTML = """
       });
       selectedTaskUid = null;
       await refresh();
+      const banner = document.getElementById('runnerBanner');
+      banner.textContent = `已导入 ${result.count || 0} 条任务，可以开始采集。`;
+      banner.className = 'runner-banner paused';
     };
 
     document.getElementById('runBtn').onclick = async () => {
       const result = await api('/api/run', { method: 'POST' });
-      if (!result.ok) alert(result.message || '启动失败');
+      if (!result.ok) {
+        alert(result.message || '启动失败');
+        const banner = document.getElementById('runnerBanner');
+        banner.textContent = result.message || '启动失败';
+        banner.className = 'runner-banner pause-requested';
+      }
       await refresh();
     };
 

@@ -36,7 +36,7 @@ GATE_MARKERS = (
 
 
 def run_deepseek(task: dict) -> dict:
-    screenshot_path, answer_path, url_path = _make_paths(task)
+    screenshot_path, answer_path, url_path, search_results_path = _make_paths(task)
     if not _cdp_is_available():
         screenshot = _desktop_screenshot(screenshot_path)
         return {
@@ -45,12 +45,22 @@ def run_deepseek(task: dict) -> dict:
             "answer_text_path": "",
             "answer_url": "",
             "url_text_path": "",
+            "search_results_path": "",
+            "search_result_count": "",
+            "search_read_count": "",
             "remark": "cdp_not_available_请先运行 yingdao_mvp/start_chrome_cdp.command",
         }
-    return _run_deepseek_cdp(task, screenshot_path, answer_path, url_path)
+    return _run_deepseek_cdp(task, screenshot_path, answer_path, url_path, search_results_path)
 
 
-def _run_deepseek_cdp(task: dict, screenshot_path: Path, answer_path: Path, url_path: Path) -> dict:
+def _run_deepseek_cdp(
+    task: dict,
+    screenshot_path: Path,
+    answer_path: Path,
+    url_path: Path,
+    search_results_path: Path,
+) -> dict:
+    question_text = str(task.get("question") or "")
     try:
         _cdp_open_deepseek(fresh=True)
     except Exception as exc:
@@ -61,10 +71,13 @@ def _run_deepseek_cdp(task: dict, screenshot_path: Path, answer_path: Path, url_
             "answer_text_path": "",
             "answer_url": "",
             "url_text_path": "",
+            "search_results_path": "",
+            "search_result_count": "",
+            "search_read_count": "",
             "remark": _short_remark(f"cdp_open_failed: {exc}"),
         }
 
-    time.sleep(3)
+    time.sleep(1.5)
     gate_reason = _cdp_gate_reason()
     if gate_reason:
         screenshot = _cdp_capture_page_screenshot(screenshot_path)
@@ -76,10 +89,13 @@ def _run_deepseek_cdp(task: dict, screenshot_path: Path, answer_path: Path, url_
             "answer_text_path": "",
             "answer_url": answer_url,
             "url_text_path": url_text_path,
+            "search_results_path": "",
+            "search_result_count": "",
+            "search_read_count": "",
             "remark": f"DeepSeek 触发登录/验证/风控: {gate_reason}",
         }
 
-    if not _cdp_submit_question(str(task.get("question") or "")):
+    if not _cdp_submit_question(question_text):
         screenshot = _cdp_capture_page_screenshot(screenshot_path)
         answer_url = _cdp_current_url()
         url_text_path = _write_url(url_path, answer_url)
@@ -89,6 +105,9 @@ def _run_deepseek_cdp(task: dict, screenshot_path: Path, answer_path: Path, url_
             "answer_text_path": "",
             "answer_url": answer_url,
             "url_text_path": url_text_path,
+            "search_results_path": "",
+            "search_result_count": "",
+            "search_read_count": "",
             "remark": "cdp_input_not_found_or_send_failed",
         }
 
@@ -104,31 +123,50 @@ def _run_deepseek_cdp(task: dict, screenshot_path: Path, answer_path: Path, url_
             "answer_text_path": "",
             "answer_url": answer_url,
             "url_text_path": url_text_path,
+            "search_results_path": "",
+            "search_result_count": "",
+            "search_read_count": "",
             "remark": f"DeepSeek 触发登录/验证/风控: {gate_reason}",
         }
 
     answer_text = _cdp_wait_answer()
     answer_url = _cdp_current_url()
+    search_fields, search_remark = _capture_search_results(
+        search_results_path, question_text, answer_url
+    )
     try:
         screenshot, extracted_text, screenshot_mode = _cdp_capture_deepseek_evidence(
-            screenshot_path, str(task.get("question") or "")
+            screenshot_path, question_text
         )
         if extracted_text:
             answer_text = extracted_text
     except Exception as exc:
         screenshot = _cdp_capture_page_screenshot(screenshot_path)
-        answer_text_path = _write_answer(answer_path, answer_text)
+        answer_text_path = _write_answer(answer_path, _format_qa_text(question_text, answer_text))
         url_text_path = _write_url(url_path, answer_url)
+        if answer_text and screenshot:
+            return {
+                "status": "success",
+                "screenshot_path": screenshot,
+                "answer_text_path": answer_text_path,
+                "answer_url": answer_url,
+                "url_text_path": url_text_path,
+                **search_fields,
+                "answer_text_length": len(answer_text),
+                "remark": _short_remark(f"正常完成_截图降级: {exc}{search_remark}"),
+            }
         return {
             "status": "failed",
             "screenshot_path": screenshot,
             "answer_text_path": answer_text_path,
             "answer_url": answer_url,
             "url_text_path": url_text_path,
-            "remark": _short_remark(f"cdp_screenshot_failed: {exc}"),
+            **search_fields,
+            "answer_text_length": len(answer_text),
+            "remark": _short_remark(f"cdp_screenshot_failed: {exc}{search_remark}"),
         }
 
-    answer_text_path = _write_answer(answer_path, answer_text)
+    answer_text_path = _write_answer(answer_path, _format_qa_text(question_text, answer_text))
     url_text_path = _write_url(url_path, answer_url)
     return {
         "status": "success" if answer_text else "failed",
@@ -136,10 +174,13 @@ def _run_deepseek_cdp(task: dict, screenshot_path: Path, answer_path: Path, url_
         "answer_text_path": answer_text_path,
         "answer_url": answer_url,
         "url_text_path": url_text_path,
+        **search_fields,
+        "answer_text_length": len(answer_text),
+        "screenshot_mode": screenshot_mode,
         "remark": (
-            f"正常完成_{screenshot_mode}"
+            f"正常完成_{screenshot_mode}{search_remark}"
             if answer_text
-            else f"timeout_waiting_answer_{screenshot_mode}_未提取文本"
+            else f"timeout_waiting_answer_{screenshot_mode}_未提取文本{search_remark}"
         ),
     }
 
@@ -170,7 +211,7 @@ def _safe_path_part(value: str, limit: int = 90) -> str:
     return safe[:limit].strip() or "未命名问题"
 
 
-def _make_paths(task: dict) -> tuple[Path, Path, Path]:
+def _make_paths(task: dict) -> tuple[Path, Path, Path, Path]:
     question_folder = _safe_path_part(task.get("question") or task.get("id") or f"row_{_time_tag()}")
     output_dir = RESULTS_DIR / _date_tag() / question_folder
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -178,7 +219,12 @@ def _make_paths(task: dict) -> tuple[Path, Path, Path]:
     platform = str(task.get("platform") or "deepseek")
     round_value = str(task.get("round") or "1")
     base = f"{safe_id}_{platform}_round{round_value}_{_time_tag()}"
-    return output_dir / f"{base}.png", output_dir / f"{base}.txt", output_dir / f"{base}_url.txt"
+    return (
+        output_dir / f"{base}.png",
+        output_dir / f"{base}.txt",
+        output_dir / f"{base}_url.txt",
+        output_dir / f"{base}_search_results.json",
+    )
 
 
 def _write_answer(answer_path: Path, answer_text: str) -> str:
@@ -187,10 +233,263 @@ def _write_answer(answer_path: Path, answer_text: str) -> str:
     return str(answer_path)
 
 
+def _format_qa_text(question: str, answer_text: str) -> str:
+    question = str(question or "").strip()
+    answer_text = str(answer_text or "").strip()
+    if not question:
+        return answer_text
+    if not answer_text:
+        return f"问题：\n{question}\n\n回答：\n"
+    return f"问题：\n{question}\n\n回答：\n{answer_text}\n"
+
+
 def _write_url(url_path: Path, answer_url: str) -> str:
     url_path.parent.mkdir(parents=True, exist_ok=True)
     url_path.write_text(answer_url or "", encoding="utf-8")
     return str(url_path)
+
+
+def _write_search_results(search_results_path: Path, payload: dict) -> dict[str, str | int]:
+    search_results_path.parent.mkdir(parents=True, exist_ok=True)
+    search_results_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    results = payload.get("results") or []
+    read_count = payload.get("read_count")
+    return {
+        "search_results_path": str(search_results_path),
+        "search_result_count": len(results) if isinstance(results, list) else 0,
+        "search_read_count": read_count if read_count is not None else "",
+    }
+
+
+def _capture_search_results(
+    search_results_path: Path, question: str, answer_url: str
+) -> tuple[dict[str, str | int], str]:
+    try:
+        payload = _cdp_extract_search_results(question, answer_url)
+    except Exception as exc:
+        payload = {
+            "schema_version": 1,
+            "parser_version": 2,
+            "parse_method": "search_panel_card_dom",
+            "captured_at": _now(),
+            "question": question,
+            "answer_url": answer_url,
+            "read_count": None,
+            "read_count_text": "",
+            "results": [],
+            "citation_links": [],
+            "extraction_status": "failed",
+            "error": _short_remark(str(exc), 300),
+        }
+    fields = _write_search_results(search_results_path, payload)
+    status = str(payload.get("extraction_status") or "")
+    if status == "failed":
+        return fields, "_搜索结果提取失败"
+    if status == "not_found":
+        return fields, "_未发现搜索结果"
+    return fields, ""
+
+
+def _cdp_extract_search_results(question: str, answer_url: str) -> dict:
+    ws_url = _cdp_deepseek_ws_url()
+    if not ws_url:
+        raise RuntimeError("cdp_not_available")
+    expression = r"""
+    (async () => {
+      const clean = text => (text || '').replace(/\u00a0/g, ' ').replace(/[ \t]+\n/g, '\n').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+      const compact = text => clean(text).replace(/\s+/g, ' ');
+      const visible = el => {
+        if (!el || !el.getBoundingClientRect) return false;
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const absoluteUrl = href => {
+        try { return new URL(href, location.href).href; } catch (_) { return href || ''; }
+      };
+      const datePattern = /\b\d{4}[\/-]\d{1,2}[\/-]\d{1,2}\b/;
+      const bodyText = clean(document.body ? document.body.innerText : '');
+      const readMatch = bodyText.match(/已阅读\s*(\d+)\s*个网页/);
+      const readCountText = readMatch ? readMatch[0] : '';
+      const readCount = readMatch ? Number(readMatch[1]) : null;
+
+      const findSearchPanel = () => {
+        const candidates = Array.from(document.querySelectorAll('aside,section,main,div,[role="complementary"],[role="dialog"],[class*="search"],[class*="reference"],[class*="side"]'))
+          .filter(el => visible(el))
+          .map(el => {
+            const text = clean(el.innerText || '');
+            const links = Array.from(el.querySelectorAll('a[href]')).filter(a => /^https?:/i.test(absoluteUrl(a.getAttribute('href') || a.href || '')));
+            let score = 0;
+            if (text.includes('搜索结果')) score += 1000;
+            if (/已阅读\s*\d+\s*个网页/.test(text)) score += 700;
+            if (text.includes('网页')) score += 120;
+            score += Math.min(links.length, 20) * 50;
+            if (text.length > 0) score -= Math.min(text.length / 200, 100);
+            return { el, text, links, score };
+          })
+          .filter(item => item.links.length > 0 && item.score > 100)
+          .sort((a, b) => b.score - a.score || a.text.length - b.text.length);
+        const searchPanels = candidates
+          .filter(item => item.text.includes('搜索结果'))
+          .sort((a, b) => b.el.getBoundingClientRect().left - a.el.getBoundingClientRect().left || a.text.length - b.text.length);
+        return searchPanels.length ? searchPanels[0].el : null;
+      };
+      const revealSearchPanel = async () => {
+        const triggers = Array.from(document.querySelectorAll('button,[role="button"],a,span,div'))
+          .filter(el => visible(el))
+          .map(el => {
+            const text = compact(el.innerText || el.textContent || el.getAttribute('aria-label') || el.title || '');
+            const rect = el.getBoundingClientRect();
+            return { el, text, area: rect.width * rect.height };
+          })
+          .filter(item => /已阅读\s*\d+\s*个网页/.test(item.text) && item.text.length <= 80)
+          .sort((a, b) => a.text.length - b.text.length || a.area - b.area);
+        if (!triggers.length) return false;
+        const trigger = triggers[0].el.closest('button,[role="button"],a') || triggers[0].el;
+        try { trigger.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+        try { trigger.click(); } catch (_) {}
+        try {
+          trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+          trigger.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+          trigger.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        } catch (_) {}
+        await new Promise(resolve => setTimeout(resolve, 900));
+        return true;
+      };
+
+      let panel = findSearchPanel();
+      let panel_revealed = false;
+      if (!panel && readMatch) {
+        panel_revealed = await revealSearchPanel();
+        panel = findSearchPanel();
+      }
+      const seenUrls = new Set();
+      const results = [];
+      if (panel) {
+        const anchors = Array.from(panel.querySelectorAll('a[href]')).filter(a => /^https?:/i.test(absoluteUrl(a.getAttribute('href') || a.href || '')));
+        for (const anchor of anchors) {
+          const url = absoluteUrl(anchor.getAttribute('href') || anchor.href || '');
+          if (!url || seenUrls.has(url)) continue;
+          seenUrls.add(url);
+
+          const titleEl = anchor.querySelector('[class*="search-view-card__title"],[class*="card__title"],[class*="title"]');
+          const snippetEl = anchor.querySelector('[class*="search-view-card__snippet"],[class*="card__snippet"],[class*="snippet"]');
+          const rawText = clean(anchor.innerText || '');
+          const lines = rawText.split('\n').map(line => compact(line)).filter(Boolean);
+          const dateLine = lines.find(line => datePattern.test(line)) || '';
+          const date = dateLine.match(datePattern)?.[0] || '';
+          const titleFromDom = compact(titleEl ? titleEl.innerText : '');
+          const snippetFromDom = clean(snippetEl ? snippetEl.innerText : '');
+          const titleFromAnchor = compact(anchor.getAttribute('aria-label') || anchor.title || '');
+          const rankLine = lines.find(line => /^\d{1,3}$/.test(line)) || '';
+          const rankIndex = rankLine ? lines.indexOf(rankLine) : -1;
+          const rank = rankLine ? Number(rankLine) : results.length + 1;
+
+          let source = '';
+          if (dateLine) {
+            const beforeDate = compact(dateLine.split(date)[0] || '').replace(/[|｜·•-]+$/g, '').trim();
+            if (beforeDate && beforeDate.length <= 60 && beforeDate !== dateLine) {
+              source = beforeDate;
+            }
+          }
+          if (!source && dateLine) {
+            const dateIndex = lines.indexOf(dateLine);
+            for (let index = dateIndex - 1; index >= 0; index -= 1) {
+              const line = lines[index].replace(/[|｜·•-]+$/g, '').trim();
+              if (!/^\d{1,3}$/.test(line) && line !== '搜索结果' && !datePattern.test(line) && line.length <= 60) {
+                source = line;
+                break;
+              }
+            }
+          }
+          if (!source) {
+            source = lines.find(line => !/^\d{1,3}$/.test(line) && line !== '搜索结果' && !datePattern.test(line) && line.length <= 60) || '';
+          }
+
+          const titleFromLine = rankIndex >= 0 ? (lines.slice(rankIndex + 1).find(line => {
+            if (/^\d{1,3}$/.test(line)) return false;
+            if (date && line.includes(date) && line.length <= 30) return false;
+            if (line === source) return false;
+            return line.length >= 6;
+          }) || '') : '';
+          const titleAnchorCandidate = titleFromAnchor.length <= 160 ? titleFromAnchor : '';
+
+          const title = titleFromDom || titleFromLine || titleAnchorCandidate || lines.find(line => {
+            if (/^\d{1,3}$/.test(line)) return false;
+            if (line === source) return false;
+            if (line === date) return false;
+            if (date && line.includes(date)) return false;
+            return line.length >= 6;
+          }) || '';
+
+          const snippetFromLines = lines.filter(line => {
+            if (/^\d{1,3}$/.test(line)) return false;
+            if (line === source || line === title || line === date || line === dateLine) return false;
+            if (date && line.includes(date) && line.length <= 30) return false;
+            return true;
+          }).join('\n');
+          const snippet = snippetFromDom || snippetFromLines;
+
+          results.push({ rank, source, date, title, url, snippet, raw_text: rawText });
+        }
+      }
+
+      const answerSelectors = ['.ds-markdown','[class*="markdown"]','article','[class*="answer"]','[class*="message-content"]','[class*="message"]'];
+      let answer = null;
+      for (const selector of answerSelectors) {
+        const matches = Array.from(document.querySelectorAll(selector)).filter(el => visible(el) && clean(el.innerText || '').length > 20);
+        if (matches.length) { answer = matches[matches.length - 1]; break; }
+      }
+      const citationLinks = [];
+      const seenCitationUrls = new Set();
+      if (answer) {
+        for (const link of Array.from(answer.querySelectorAll('a[href]'))) {
+          const url = absoluteUrl(link.getAttribute('href') || link.href || '');
+          if (!/^https?:/i.test(url) || seenCitationUrls.has(url)) continue;
+          seenCitationUrls.add(url);
+          const text = compact(link.innerText || link.getAttribute('aria-label') || link.title || '');
+          citationLinks.push({
+            marker: text.replace(/^\[|\]$/g, '') || String(citationLinks.length + 1),
+            text,
+            url,
+          });
+        }
+      }
+
+      const extractionStatus = results.length || readCount !== null || citationLinks.length ? 'success' : 'not_found';
+      return JSON.stringify({
+        parser_version: 2,
+        parse_method: 'search_panel_card_dom',
+        search_panel_revealed: panel_revealed,
+        search_panel_found: Boolean(panel),
+        read_count: readCount,
+        read_count_text: readCountText,
+        results,
+        citation_links: citationLinks,
+        extraction_status: extractionStatus,
+      });
+    })()
+    """
+    with _CdpWebSocket(ws_url) as cdp:
+        cdp.send_cmd("Runtime.enable")
+        data = json.loads(_cdp_evaluate(cdp, expression) or "{}")
+    data.setdefault("read_count", None)
+    data.setdefault("read_count_text", "")
+    data.setdefault("results", [])
+    data.setdefault("citation_links", [])
+    data.setdefault("extraction_status", "not_found")
+    return {
+        "schema_version": 1,
+        "parser_version": 2,
+        "parse_method": "search_panel_card_dom",
+        "captured_at": _now(),
+        "question": question,
+        "answer_url": answer_url,
+        **data,
+    }
 
 
 class _CdpWebSocket:
@@ -605,25 +904,37 @@ def _cdp_capture_page_screenshot(screenshot_path: Path) -> str:
     if not ws_url:
         return _desktop_screenshot(screenshot_path)
     screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-    with _CdpWebSocket(ws_url) as cdp:
-        cdp.send_cmd("Page.enable")
-        _cdp_bring_to_front(cdp)
-        metrics = cdp.send_cmd("Page.getLayoutMetrics")
-        content_size = metrics.get("contentSize") or {}
-        width = max(1, int(content_size.get("width") or 1400))
-        height = max(1, int(content_size.get("height") or 1000))
-        data = cdp.send_cmd(
-            "Page.captureScreenshot",
-            {
-                "format": "png",
-                "fromSurface": False,
-                "captureBeyondViewport": True,
-                "clip": {"x": 0, "y": 0, "width": width, "height": height, "scale": 1},
-            },
-        )
-    screenshot_path.write_bytes(base64.b64decode(data["data"]))
-    _add_timestamp_to_image(screenshot_path)
-    return str(screenshot_path)
+    try:
+        with _CdpWebSocket(ws_url) as cdp:
+            cdp.send_cmd("Page.enable")
+            try:
+                cdp.send_cmd("Page.bringToFront")
+            except Exception:
+                pass
+            metrics = cdp.send_cmd("Page.getLayoutMetrics")
+            content_size = metrics.get("contentSize") or {}
+            width = max(1, int(content_size.get("width") or 1400))
+            height = max(1, int(content_size.get("height") or 1000))
+            attempts = [
+                {"format": "png", "fromSurface": True, "captureBeyondViewport": True, "clip": {"x": 0, "y": 0, "width": width, "height": height, "scale": 1}},
+                {"format": "png", "fromSurface": False, "captureBeyondViewport": True, "clip": {"x": 0, "y": 0, "width": width, "height": height, "scale": 1}},
+                {"format": "png", "fromSurface": True, "captureBeyondViewport": False},
+                {"format": "png", "fromSurface": False, "captureBeyondViewport": False},
+            ]
+            last_error = None
+            for params in attempts:
+                try:
+                    data = cdp.send_cmd("Page.captureScreenshot", params)
+                    screenshot_path.write_bytes(base64.b64decode(data["data"]))
+                    _add_timestamp_to_image(screenshot_path)
+                    return str(screenshot_path)
+                except Exception as exc:
+                    last_error = exc
+            if last_error:
+                raise last_error
+    except Exception:
+        return _desktop_screenshot(screenshot_path)
+    return _desktop_screenshot(screenshot_path)
 
 
 def _cdp_enter_qa_capture_mode(cdp: _CdpWebSocket) -> None:
@@ -1051,23 +1362,33 @@ def _cdp_capture_deepseek_evidence(screenshot_path: Path, question: str) -> tupl
                 cdp.send_cmd("Runtime.evaluate", {"expression": cleanup, "returnByValue": True})
             except Exception:
                 pass
-            screenshot, pages = _cdp_capture_scroll_stitched_evidence(screenshot_path)
-            return screenshot, answer_text, f"CDP真实页面滚动拼接_pages={pages}"
-        data = cdp.send_cmd(
-            "Page.captureScreenshot",
-            {
-                "format": "png",
-                "fromSurface": False,
-                "captureBeyondViewport": True,
-                "clip": {"x": 0, "y": 0, "width": width, "height": height, "scale": 1},
-            },
-        )
-        screenshot_path.write_bytes(base64.b64decode(data["data"]))
-        _add_timestamp_to_image(screenshot_path)
+            try:
+                screenshot, pages = _cdp_capture_scroll_stitched_evidence(screenshot_path)
+                return screenshot, answer_text, f"CDP真实页面滚动拼接_pages={pages}"
+            except Exception:
+                result = cdp.send_cmd("Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True})
+                info = json.loads(((result.get("result") or {}).get("value")) or "{}")
+                if not info.get("ok"):
+                    raise RuntimeError(f"cdp_clean_capture_failed: {info.get('reason')}")
+                width = max(1, int(info.get("width") or width))
+                height = max(1, int(info.get("height") or height))
         try:
-            cdp.send_cmd("Runtime.evaluate", {"expression": cleanup, "returnByValue": True})
-        except Exception:
-            pass
+            data = cdp.send_cmd(
+                "Page.captureScreenshot",
+                {
+                    "format": "png",
+                    "fromSurface": True,
+                    "captureBeyondViewport": True,
+                    "clip": {"x": 0, "y": 0, "width": width, "height": height, "scale": 1},
+                },
+            )
+            screenshot_path.write_bytes(base64.b64decode(data["data"]))
+            _add_timestamp_to_image(screenshot_path)
+        finally:
+            try:
+                cdp.send_cmd("Runtime.evaluate", {"expression": cleanup, "returnByValue": True})
+            except Exception:
+                pass
         return str(screenshot_path), answer_text, "CDP真实页面全图"
 
 

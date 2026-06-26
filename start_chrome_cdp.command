@@ -10,7 +10,8 @@ if pgrep -x "Google Chrome" >/dev/null 2>&1; then
   sleep 2
 fi
 
-PROFILE="/Users/pan/Documents/思阳/geo-evidence-collector/yingdao_mvp/chrome_cdp_profile"
+cd "$(dirname "$0")"
+PROFILE="$(pwd)/chrome_cdp_profile"
 mkdir -p "$PROFILE"
 
 open -na "Google Chrome" --args \
@@ -23,6 +24,6 @@ open -na "Google Chrome" --args \
   "https://chat.deepseek.com/" \
   >/tmp/yingdao_chrome_cdp.log 2>&1
 
-echo "已启动。请确认这个专用 Chrome 里的 DeepSeek 登录态正常后，再运行影刀流程。"
+echo "已启动。请确认这个专用 Chrome 里的 DeepSeek 登录态正常后，再运行 Web 后台。"
 echo "专用 Chrome 用户目录：$PROFILE"
 echo "CDP 日志：/tmp/yingdao_chrome_cdp.log"

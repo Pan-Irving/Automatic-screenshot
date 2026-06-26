@@ -5,7 +5,7 @@
 - 本地 Web 后台：推荐给运营团队使用，Excel 只负责导入和导出，运行状态保存到 `runtime/tasks.json`。
 - 影刀流程：保留原有影刀代码流程作为备用入口。
 
-采集不接入现有 FastAPI/Playwright 服务，仍通过 CDP Chrome 使用真实登录态访问 DeepSeek。
+采集通过本地 Chrome 的 CDP 端口复用真实登录态。当前使用原手写 CDP 采集器。
 
 ## 本地 Web 后台
 
@@ -33,18 +33,30 @@
 - `runtime/tasks.json`：Web 后台的主状态文件。
 - `runtime/events.jsonl`：导入、启动、完成、暂停、重试、导出等事件日志。
 - `runtime/exported_tasks.xlsx`：最近一次导出的结果 Excel。
+- `yingdao_results/YYYYMMDD/{question}/`：每轮保存回答文本、对话 URL、截图和可选 HTML 页面。
 
 第一版不使用数据库。Excel 是任务导入/结果导出格式，不再作为采集过程中的实时状态文件。
+
+## 采集器配置
+
+默认使用 CDP 采集器：
+
+```bash
+YINGDAO_COLLECTOR=cdp python3 server.py
+```
+
+采集器连接 `start_chrome_cdp.command` 打开的专用 Chrome。每条任务都会打开新的 DeepSeek 页面，避免 GEO 前置探测的上下文污染。
 
 ## 文件约定
 
 - 任务表：`/Users/pan/Documents/思阳/geo-evidence-collector/yingdao_mvp/questions.xlsx`
 - 任务 Sheet：`Tasks`
-- 输出目录：`/Users/pan/Documents/思阳/geo-evidence-collector/yingdao_mvp/yingdao_results/YYYYMMDD/`
+- 输出目录：`yingdao_results/YYYYMMDD/`
 - 输出子目录：`{question}/`
 - 截图文件名：`{id}_{platform}_round{round}_{HHMMSS}.png`
-- 回答文件名：`{id}_{platform}_round{round}_{HHMMSS}.txt`
+- 回答文件名：`{id}_{platform}_round{round}_{HHMMSS}.txt`，内容包含本轮问题和 DeepSeek 回答。
 - 链接文件名：`{id}_{platform}_round{round}_{HHMMSS}_url.txt`
+- 搜索结果文件名：`{id}_{platform}_round{round}_{HHMMSS}_search_results.json`，内容为 DeepSeek 页面已展示的搜索结果证据。
 
 ## 本机影刀应用
 
@@ -69,6 +81,9 @@
 | `answer_text_path` | 影刀保存回答文本后写回的绝对路径 |
 | `answer_url` | DeepSeek 当前对话链接 |
 | `url_text_path` | 保存对话链接的文本文件路径 |
+| `search_results_path` | 保存搜索结果 JSON 的绝对路径 |
+| `search_result_count` | JSON 中解析到的搜索结果条数 |
+| `search_read_count` | DeepSeek 页面显示的已阅读网页数 |
 | `remark` | 错误、验证或人工接管说明 |
 | `updated_at` | 当前处理时间 |
 
@@ -86,7 +101,7 @@
    - `updated_at = 当前时间`
 5. 调用子流程 `RunDeepSeek`。
 6. 子流程返回后写回当前行。
-7. 每个问题完成后等待 60 到 180 秒，建议先固定 90 秒。
+7. 每个问题完成后等待 3 到 8 秒。
 8. 继续下一行。
 
 ## 子流程 RunDeepSeek
@@ -105,6 +120,7 @@
 | `base_name` | `{task_id}_{platform}_round{round}_{time_tag}` |
 | `screenshot_path` | `{output_dir}/{base_name}.png` |
 | `answer_text_path` | `{output_dir}/{base_name}.txt` |
+| `search_results_path` | `{output_dir}/{base_name}_search_results.json` |
 
 流程步骤：
 
@@ -132,15 +148,21 @@
 10. 点击发送按钮。
 11. 等待回答完成：
     - 优先等待“停止生成”按钮出现后消失。
-    - 如果捕获不到该元素，第一版固定等待 90 秒。
+    - 默认最长等待 150 秒，期间每 2 秒检查一次回答文本是否稳定。
 12. 再次检查人工接管关键字。如果命中，截图并返回 `manual_required`。
 13. 尽量获取最后一条回答文本，保存到 `answer_text_path`。
-14. 保存当前页面截图到 `screenshot_path`。
-15. 返回：
+14. 从页面 DOM 提取右侧“搜索结果/已阅读网页”数据，保存到 `search_results_path`。
+15. 保存当前页面截图到 `screenshot_path`。
+16. 返回：
     - `status = success`
     - `screenshot_path`
     - `answer_text_path`
+    - `search_results_path`
+    - `search_result_count`
+    - `search_read_count`
     - `remark = 正常完成`
+
+搜索结果 JSON 只记录 DeepSeek 页面已经暴露的数据，包括已阅读网页数、搜索结果标题、来源站点、日期、URL、摘要，以及回答正文里的引用链接。DeepSeek 内部搜索关键词、排序权重和未展示候选网页不会稳定暴露，当前流程不采集这类内部信息。
 
 ## 异常处理
 
@@ -179,7 +201,7 @@
 ## 低风控运行参数
 
 - 一次只处理一个问题。
-- 每题之间等待 60 到 180 秒；第一版固定 90 秒。
+- 每题之间默认等待 3 到 8 秒。
 - 不使用多账号轮换。
 - 不并发打开多个 DeepSeek 窗口。
 - 不在验证后连续重试。
@@ -191,5 +213,6 @@
 2. 运行影刀流程，确认 3 行都写回 `success`。
 3. 检查 `screenshot_path` 对应文件存在，截图中能看到问题和回答。
 4. 检查 `answer_text_path` 对应文件存在；如果影刀取不到文本，允许为空，但 `remark` 要说明。
-5. 手动退出 DeepSeek 登录后再跑 1 行，确认写回 `manual_required` 且保存登录/验证页截图。
-6. 人工完成登录，将该行改回 `pending`，确认可继续完成采集。
+5. 检查 `search_results_path` 对应 JSON 存在；有智能搜索结果时应包含 `read_count`、`results` 和 `citation_links`。
+6. 手动退出 DeepSeek 登录后再跑 1 行，确认写回 `manual_required` 且保存登录/验证页截图。
+7. 人工完成登录，将该行改回 `pending`，确认可继续完成采集。
